@@ -10,14 +10,14 @@ ARCH:=mipsel
 BOARD:=xburst
 BOARDNAME:=Ingenic XBurst
 FEATURES:=targz usb ext4 fpu
-SUBTARGETS:=qi_lb60
+SUBTARGETS:=halley5 qi_lb60
 
 KERNEL_PATCHVER:=6.1
 
 DEVICE_TYPE:=other
 
 define Target/Description
-	Build firmware images for XBurst JZ47x0 based boards.
+	Build firmware images for Ingenic XBurst X-series SoC based boards.
 endef
 
 include $(INCLUDE_DIR)/target.mk
@@ -27,5 +27,7 @@ define Kernel/Prepare/Default
 	$(call PatchDir,$(LINUX_DIR),$(PATCH_DIR),platform/)
 endef
 
+DEFAULT_PACKAGES += e2fsprogs kmod-fs-vfat \
+        kmod-usb-dwc2 partx-utils kmod-phy-ingenic-usb
 
 $(eval $(call BuildTarget))

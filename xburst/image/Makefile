@@ -22,8 +22,8 @@ UIMAGE:=$(BIN_DIR)/$(IMG_PREFIX)-uImage.bin
 
 define MkImageGzip
 	gzip -9n -c $(1) > $(1).gz
-	mkimage -A mips -O linux -T kernel -a 0x80010000 -C gzip \
-		-e 0x80010000 -n 'MIPS OpenWrt Linux-$(LINUX_VERSION)' \
+	mkimage -A mips -O linux -T kernel -a 0x80100000 -C gzip \
+		-e 0x80100000 -n 'MIPS OpenWrt Linux-$(LINUX_VERSION)' \
 		-d $(1).gz $(2)
 endef
 

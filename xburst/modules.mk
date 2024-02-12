@@ -1,40 +1,35 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Copyright (c) 2022 Tomasz Maciej Nowak <tmn505@gmail.com>
 
-
-SOUND_MENU:=Sound Support
-
-define KernelPackage/sound-soc-jz4740
-  SUBMENU:=$(SOUND_MENU)
-  DEPENDS:=kmod-sound-soc-core @TARGET_xburst @BROKEN
-  TITLE:=JZ4740 SoC sound support
-  KCONFIG:=CONFIG_SND_JZ4740_SOC CONFIG_SND_JZ4740_SOC_I2S
-  FILES:= \
-	$(LINUX_DIR)/sound/soc/jz4740/snd-soc-jz4740.ko \
-	$(LINUX_DIR)/sound/soc/jz4740/snd-soc-jz4740-i2s.ko
-  AUTOLOAD:=$(call AutoLoad,60,snd-soc-jz4740 snd-soc-jz4740-i2s)
+define KernelPackage/phy-ingenic-usb
+  SUBMENU := $(USB_MENU)
+  TITLE := Ingenic SoCs USB PHY
+  CONFLICTS := kmod-usb-phy-ingenic
+  DEPENDS:= @TARGET_xburst
+  KCONFIG := CONFIG_PHY_INGENIC_USB
+  FILES := $(LINUX_DIR)/drivers/phy/ingenic/phy-ingenic-usb.ko
+  AUTOLOAD := $(call AutoLoad,21,phy-ingenic-usb,1)
 endef
 
-define KernelPackage/sound-soc-jz4740-codec
-  SUBMENU:=$(SOUND_MENU)
-  DEPENDS:=kmod-sound-soc-core @TARGET_xburst @BROKEN
-  TITLE:=JZ4740 SoC internal codec support
-  KCONFIG:=CONFIG_SND_SOC_JZ4740_CODEC
-  FILES:=$(LINUX_DIR)/sound/soc/codecs/snd-soc-jz4740-codec.ko
-  AUTOLOAD:=$(call AutoLoad,60,snd-soc-jz4740-codec)
+define KernelPackage/phy-ingenic-usb/description
+  Supports Ingenic SoC USB PHY starting from JZ4770.
 endef
 
-define KernelPackage/sound-soc-xburst/default
-  SUBMENU:=$(SOUND_MENU)
-  DEPENDS:=kmod-sound-soc-jz4740 kmod-sound-soc-jz4740-codec @TARGET_xburst_$(if $(4),$(4),$(3)) @BROKEN
-  TITLE:=$(1) sound support
-  KCONFIG:=CONFIG_SND_JZ4740_SOC_$(2)
-  FILES:=$(LINUX_DIR)/sound/soc/jz4740/snd-soc-$(3).ko
-  AUTOLOAD:=$(call AutoLoad,65,snd-soc-$(3))
+$(eval $(call KernelPackage,phy-ingenic-usb))
+
+
+define KernelPackage/usb-phy-ingenic
+  SUBMENU := $(USB_MENU)
+  TITLE := Ingenic USB PHY
+  DEPENDS := @LINUX_5_15||LINUX_6_1 +kmod-usb-core
+  KCONFIG := CONFIG_JZ4770_PHY
+  FILES := $(LINUX_DIR)/drivers/usb/phy/phy-jz4770.ko
+  AUTOLOAD := $(call AutoLoad,21,phy-jz4770,1)
 endef
 
-define KernelPackage/sound-soc-qilb60
-$(call KernelPackage/sound-soc-xburst/default,QI NanoNote,QI_LB60,qi-lb60,qi_lb60)
+define KernelPackage/usb-phy-ingenic/description
+  Supports Ingenic SoC USB PHY starting from JZ4770.
 endef
 
-$(eval $(call KernelPackage,sound-soc-jz4740))
-$(eval $(call KernelPackage,sound-soc-jz4740-codec))
-$(eval $(call KernelPackage,sound-soc-qilb60))
+$(eval $(call KernelPackage,usb-phy-ingenic))

@@ -4,7 +4,7 @@
 
 board_config_update
 
-ucidef_set_hostname "BenNanoNote"
+ucidef_set_hostname "X2000"
 ucidef_set_ntpserver
 
 board_config_flush
