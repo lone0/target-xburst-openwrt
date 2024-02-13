@@ -27,7 +27,7 @@ define Kernel/Prepare/Default
 	$(call PatchDir,$(LINUX_DIR),$(PATCH_DIR),platform/)
 endef
 
-DEFAULT_PACKAGES += e2fsprogs kmod-fs-vfat kmod-brcmfmac \
+DEFAULT_PACKAGES += e2fsprogs kmod-fs-vfat kmod-brcmfmac wpad-basic-mbedtls \
         kmod-usb-dwc2 partx-utils kmod-phy-ingenic-usb
 
 $(eval $(call BuildTarget))
