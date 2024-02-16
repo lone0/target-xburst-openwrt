@@ -72,8 +72,6 @@ Date:   Sun Feb 4 04:09:14 2024 +0900
 
    Now check on your phone whether WiFi signal 'OpenWrt' is available.
 
-   All done, enjoy.
-    
 5. Enable 4G Modem on device
    Edit /etc/config/network and append the following section:
 
@@ -97,3 +95,6 @@ Date:   Sun Feb 4 04:09:14 2024 +0900
    ```
 
    Again restart the service network.
+
+   All done, enjoy.
+    
