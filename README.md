@@ -65,12 +65,36 @@ Date:   Sun Feb 4 04:09:14 2024 +0900
    Once the kernel and rootfs are flashed and device is up, the WiFi is disabled by default. Now on the console of the device (halley5 evboard), type the following:
 
    ```
-   uci set wireless.radio0.disabled=1
+   uci set wireless.radio0.disabled=0
    uci commit wireless
    service network restart
    ```
 
    Now check on your phone whether WiFi signal 'OpenWrt' is available.
+
+5. Enable 4G Modem on device
+   Edit /etc/config/network and append the following section:
+
+   ```
+   config interface 'wwan'
+        option proto 'qmi'
+        option device '/dev/cdc-wdm0'
+        option apn 'ctnet'
+        option pdptype 'ip'
+   ```
+
+   Replace the apn name with the one from your cellular carrier.
+
+   Edit /etc/config/firewall and add interface wwan to "wan" firewall zone:
+
+   ```
+   config zone
+       option name 'wan'
+       [...]
+       list network 'wwan'
+   ```
+
+   Again restart the service network.
 
    All done, enjoy.
     
