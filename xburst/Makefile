@@ -9,23 +9,17 @@ include $(TOPDIR)/rules.mk
 ARCH:=mipsel
 BOARD:=xburst
 BOARDNAME:=Ingenic XBurst
+CPU_TYPE:=mips32
 FEATURES:=targz usb ext4 fpu
 SUBTARGETS:=halley5 qi_lb60
 
-KERNEL_PATCHVER:=6.1
-
-DEVICE_TYPE:=other
+KERNEL_PATCHVER:=6.6
 
 define Target/Description
 	Build firmware images for Ingenic XBurst X-series SoC based boards.
 endef
 
 include $(INCLUDE_DIR)/target.mk
-
-define Kernel/Prepare/Default
-	$(LINUX_CAT) $(DL_DIR)/$(LINUX_SOURCE) | $(TAR) -C $(KERNEL_BUILD_DIR) $(TAR_OPTIONS)
-	$(call PatchDir,$(LINUX_DIR),$(PATCH_DIR),platform/)
-endef
 
 DEFAULT_PACKAGES += e2fsprogs kmod-fs-vfat kmod-brcmfmac wpad-basic-mbedtls \
         kmod-usb-dwc2 partx-utils kmod-phy-ingenic-usb

@@ -1,0 +1,57 @@
+From 878fdf86a1198d4c48588a5bcb556117dc0c0d4b Mon Sep 17 00:00:00 2001
+From: Zhen XIN <lone.zen6@gmail.com>
+Date: Wed, 26 Aug 2026 03:06:33 +0800
+Subject: [PATCH 08/14] mips: ingenic: fix IRQ state across SMP startup and
+ idle
+
+MIPS brings secondary CPUs up with local interrupts disabled so that an
+interrupt cannot arrive before per-CPU exception, timer, IRQ, RCU and
+scheduler state is ready. The generic start_secondary() path explicitly
+requires the platform smp_finish callback to enable interrupts before it
+hands the CPU to cpu_startup_entry().
+
+The Ingenic callback configured the mailbox and CP0 interrupt masks but
+left the global interrupt-enable bit clear. CPU1 consequently reached its
+first tick_nohz_idle_enter() with interrupts disabled, triggering the
+lockdep assertion that the NO_HZ idle entry path must begin with IRQs
+enabled.
+
+The opposite ownership error existed in jz4780_smp_wait_irqoff(). Generic
+idle code disables interrupts before invoking an irqoff architecture idle
+callback and enables them after the callback returns. The Ingenic callback
+enabled interrupts itself, so default_idle_call() observed an unexpected
+IRQ state and RCU/lockdep boot tests warned in lockdep_hardirqs_off().
+
+Restore the MIPS IRQ-state contracts at both boundaries: enable local
+interrupts once, at the end of secondary CPU setup after mailbox, mask and
+broadcast-timer initialization; and leave interrupts disabled when the
+irqoff wait callback returns so the generic idle loop remains their sole
+owner during each idle cycle.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ arch/mips/ingenic/smp.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/arch/mips/ingenic/smp.c b/arch/mips/ingenic/smp.c
+index e2e168c0ffd8..45f512c445dc 100644
+--- a/arch/mips/ingenic/smp.c
++++ b/arch/mips/ingenic/smp.c
+@@ -119,8 +119,6 @@ void jz4780_smp_wait_irqoff(void)
+ 		"	wait			\n"
+ 		"	.set pop		\n");
+ 	}
+-
+-	local_irq_enable();
+ }
+ 
+ void jz4780_smp_switch_irqcpu(int cpu)
+@@ -475,6 +473,8 @@ static void ingenic_smp_finish(void)
+ 
+ 	/* force broadcast timer */
+ 	tick_broadcast_force();
++
++	local_irq_enable();
+ }
+ 
+ static void ingenic_xburst_send_ipi_single_locked(int cpu, unsigned int action)

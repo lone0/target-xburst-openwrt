@@ -17,19 +17,3 @@ define KernelPackage/phy-ingenic-usb/description
 endef
 
 $(eval $(call KernelPackage,phy-ingenic-usb))
-
-
-define KernelPackage/usb-phy-ingenic
-  SUBMENU := $(USB_MENU)
-  TITLE := Ingenic USB PHY
-  DEPENDS := @LINUX_5_15||LINUX_6_1 +kmod-usb-core
-  KCONFIG := CONFIG_JZ4770_PHY
-  FILES := $(LINUX_DIR)/drivers/usb/phy/phy-jz4770.ko
-  AUTOLOAD := $(call AutoLoad,21,phy-jz4770,1)
-endef
-
-define KernelPackage/usb-phy-ingenic/description
-  Supports Ingenic SoC USB PHY starting from JZ4770.
-endef
-
-$(eval $(call KernelPackage,usb-phy-ingenic))

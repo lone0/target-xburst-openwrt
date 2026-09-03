@@ -1,0 +1,51 @@
+From 3956f8ecc87caf9509668036ff61f9d6baa21f8f Mon Sep 17 00:00:00 2001
+From: Zhen XIN <lone.zen6@gmail.com>
+Date: Fri, 28 Aug 2026 00:13:15 +0800
+Subject: [PATCH 14/14] mips: separate Ingenic platform from generic objects
+
+The Ingenic system type selected MIPS_GENERIC only to reuse objects from arch/mips/generic. This also registered generic/ as a second boot platform, making platform-y contain both ingenic/ and generic/.
+
+Generic FIT image rules interpret PLATFORM as one directory, so a clean Ingenic build failed with a malformed generic//vmlinux.its.S prerequisite.
+
+Stop selecting MIPS_GENERIC for Ingenic and link the reused generic objects explicitly from arch/mips/Kbuild. Keep ingenic/ as the sole platform and restore its load address. This retains the current guarded Ingenic dependency on generic code without inheriting generic-platform image behavior.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ arch/mips/Kbuild           | 2 +-
+ arch/mips/Kconfig          | 1 -
+ arch/mips/ingenic/Platform | 2 +-
+ 3 files changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/arch/mips/Kbuild b/arch/mips/Kbuild
+index d5c014233c51..5c736f71c290 100644
+--- a/arch/mips/Kbuild
++++ b/arch/mips/Kbuild
+@@ -10,7 +10,7 @@ endif
+ include $(srctree)/arch/mips/Kbuild.platforms
+ obj-y := $(platform-y)
+ 
+-obj-$(CONFIG_MACH_INGENIC)		+= ingenic/
++obj-$(CONFIG_MACH_INGENIC)		+= generic/
+ 
+ # make clean traverses $(obj-) without having included .config, so
+ # everything ends up here
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+index 649dbdac0f09..ea2de701ea47 100644
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -433,7 +433,6 @@ config MACH_JAZZ
+ 
+ config MACH_INGENIC_SOC
+ 	bool "Ingenic SoC based machines"
+-	select MIPS_GENERIC
+ 	select MACH_INGENIC
+ 	select SYS_SUPPORTS_ZBOOT_UART16550
+ 	select CPU_SUPPORTS_CPUFREQ
+diff --git a/arch/mips/ingenic/Platform b/arch/mips/ingenic/Platform
+index f1d8f0710aa9..17d4e78dbc24 100644
+--- a/arch/mips/ingenic/Platform
++++ b/arch/mips/ingenic/Platform
+@@ -1,2 +1,2 @@
+ cflags-$(CONFIG_MACH_INGENIC_SOC)	+= -I$(srctree)/arch/mips/include/asm/mach-ingenic
+-#load-$(CONFIG_MACH_INGENIC_SOC)		+= 0xffffffff80100000
++load-$(CONFIG_MACH_INGENIC_SOC)		+= 0xffffffff80100000

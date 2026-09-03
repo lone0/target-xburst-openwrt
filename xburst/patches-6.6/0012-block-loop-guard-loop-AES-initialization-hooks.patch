@@ -1,0 +1,38 @@
+From 2c062bb244a913503c84e48ad9fe103c5bd6edc3 Mon Sep 17 00:00:00 2001
+From: Zhen XIN <lone.zen6@gmail.com>
+Date: Thu, 27 Aug 2026 00:29:35 +0800
+Subject: [PATCH 12/14] block: loop: guard loop-AES initialization hooks
+
+The loop driver called the loop-AES initialization and cleanup functions even when CONFIG_BLK_DEV_LOOP_AES was disabled. Configurations with the normal loop driver but without loop-AES consequently failed to link.
+
+Only reference the AES hooks when loop-AES support is configured.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ drivers/block/loop.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/block/loop.c b/drivers/block/loop.c
+index a727d0c5a7a4..31eb9ce076c3 100644
+--- a/drivers/block/loop.c
++++ b/drivers/block/loop.c
+@@ -2178,7 +2178,9 @@ static int __init loop_init(void)
+ 		disks[i]->queue->queuedata = NULL;
+ 	}
+ 
++#ifdef CONFIG_BLK_DEV_LOOP_AES
+ 	{ extern int init_module_aes(void); init_module_aes(); }
++#endif
+ 	for (i = 0; i < (sizeof(lo_prealloc) / sizeof(int)); i += 2) {
+ 		if (!lo_prealloc[i])
+ 			continue;
+@@ -2242,7 +2244,9 @@ static void loop_exit(void)
+ {
+ 	int i;
+ 
++#ifdef CONFIG_BLK_DEV_LOOP_AES
+ 	{ extern void cleanup_module_aes(void); cleanup_module_aes(); }
++#endif
+ 	for (i = 0; i < max_loop; i++) {
+ 		del_gendisk(disks[i]);
+ 		put_disk(disks[i]);

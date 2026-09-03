@@ -1,0 +1,5174 @@
+From f0099baaab8ce7562f9a423ad95c040a40b69c54 Mon Sep 17 00:00:00 2001
+From: Zhen XIN <lone.zen6@gmail.com>
+Date: Fri, 21 Aug 2026 20:04:16 +0800
+Subject: [PATCH 03/14] storage: add Ingenic MMC, SPI, SFC and flash support
+
+Port the custom Ingenic MSC and SDHCI drivers, nouveau SPI and SFC controllers, zero-copy spidev, LY68 MTD support, XTX SPI-NOR parts, Winbond NAND support and configurable MTD behavior.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ Documentation/spi/spi-ingenic-nouveau.rst |  100 ++
+ drivers/mmc/host/Kconfig                  |   51 +-
+ drivers/mmc/host/Makefile                 |    2 +
+ drivers/mmc/host/ingenic_mmc.c            | 1527 +++++++++++++++++++++
+ drivers/mmc/host/sdhci-ingenic.c          |  284 ++++
+ drivers/mtd/Kconfig                       |   12 +
+ drivers/mtd/devices/Kconfig               |    6 +
+ drivers/mtd/devices/Makefile              |    1 +
+ drivers/mtd/devices/ly68.c                |  288 ++++
+ drivers/mtd/mtdblock.c                    |   13 +-
+ drivers/mtd/nand/spi/winbond.c            |    6 +-
+ drivers/spi/Kconfig                       |   36 +
+ drivers/spi/Makefile                      |    3 +
+ drivers/spi/spi-ingenic-nouveau.c         |  912 ++++++++++++
+ drivers/spi/spi-ingenic-sfc.c             |  711 ++++++++++
+ drivers/spi/spidev-zerocopy.c             |  967 +++++++++++++
+ 16 files changed, 4904 insertions(+), 15 deletions(-)
+ create mode 100644 Documentation/spi/spi-ingenic-nouveau.rst
+ create mode 100644 drivers/mmc/host/ingenic_mmc.c
+ create mode 100644 drivers/mmc/host/sdhci-ingenic.c
+ create mode 100644 drivers/mtd/devices/ly68.c
+ create mode 100644 drivers/spi/spi-ingenic-nouveau.c
+ create mode 100644 drivers/spi/spi-ingenic-sfc.c
+ create mode 100644 drivers/spi/spidev-zerocopy.c
+
+
+diff --git a/Documentation/spi/spi-ingenic-nouveau.rst b/Documentation/spi/spi-ingenic-nouveau.rst
+new file mode 100644
+index 000000000000..d3f8045836fa
+--- /dev/null
++++ b/Documentation/spi/spi-ingenic-nouveau.rst
+@@ -0,0 +1,100 @@
++=================================
++Kernel driver spi-ingenic-nouveau
++=================================
++
++Supported chips:
++
++  * Ingenic X1000/X2000 series
++
++    Datasheet: https://github.com/Ingenic-community/datasheets/
++
++Author:
++	Reimu NotMoe <reimu@sudomaker.com>
++
++
++Description
++-----------
++
++A new driver of the SSI peripheral found in the Ingenic X series SoCs.
++
++Improvements:
++
++  - Interrupt driven
++
++  - Small data optimization
++
++  - DMA fills the entire FIFO space
++
++  - Transmit only mode
++
++  - Caching of frequently accessed registers
++
++  - Correct gpio-cs and active-high chip select handling
++
++
++Usage Notes
++-----------
++
++The SSI peripheral never supported controlling the hardware chip select lines
++independently from data transfer logic, and this is true since the JZ47xx era.
++
++Now with the gpio-cs there is a problem: The hardware will always active a CS
++pin (SSI_CEx) when the transfer begins. Here are a few strategies:
++
++  - Use only hardware CS (up to 2) and no gpio-cs at all
++  - Use only one hardware CS, and some gpio-cs
++  - Use gpio-cs for everything (you can disable SSI_CEx pinmux then)
++
++In the current implementation, if you choose to use only one hardware CS, it
++must be SSI_CE0 and it must appear in the first of ``cs-gpios`` and your SPI
++device definitions. Here's an example:
++
++::
++
++	&ssi {
++		status = "okay";
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&pins_spi0>;
++
++		num-cs = <3>;
++		cs-gpios = <0>, <&gpa 18 GPIO_ACTIVE_LOW>, <&gpa 17 GPIO_ACTIVE_LOW>;
++
++		lcd: lcd@0 {
++			reg = <0>;
++			compatible = "sitronix,st7735s";
++
++			spi-max-frequency = <100000000>;
++			rotate = <270>;
++			width = <128>;
++			height = <160>;
++			txbuflen = <16384>;
++			buswidth = <8>;
++			fps = <60>;
++			dc-gpios = <&gpa 10 0>;
++			reset-gpios = <&gpa 11 GPIO_ACTIVE_LOW>;
++		};
++
++		ts: tsc2046@1 {
++			reg = <1>;
++			compatible = "ti,tsc2046";
++
++			pinctrl-names = "default";
++			pinctrl-0 = <&pins_xpt2046>;
++
++			interrupt-parent = <&gpa>;
++			interrupts = <19 0>;
++			wakeup-source;
++
++			spi-max-frequency = <1000000>;
++			pendown-gpio = <&gpa 19 0>;
++		};
++
++		psram: ly68@2 {
++			reg = <2>;
++			compatible = "lyontek,ly68l6400";
++
++			spi-max-frequency = <100000000>;
++			op-sleep-ratio = <20>;
++		};
++	}
+
+diff --git a/drivers/mmc/host/Kconfig b/drivers/mmc/host/Kconfig
+index 9dea5111d48c..adb28f9d8d7f 100644
+--- a/drivers/mmc/host/Kconfig
++++ b/drivers/mmc/host/Kconfig
+@@ -14,14 +14,15 @@ config MMC_DEBUG
+ 	  added host drivers please don't invent their private macro for
+ 	  debugging.
+ 
+-config MMC_SUNPLUS
+-	tristate "Sunplus SP7021 MMC Controller"
+-	depends on ARCH_SUNPLUS || COMPILE_TEST
+-	help
+-	  If you say yes here, you will get support for eMMC host interface
+-	  on Sunplus SoCs.
+-
+-	  If unsure, say N
++config MMC_SDHCI_INGENIC
++        tristate "Ingenic(XBurst2)  MMC/SD Card Controller(MSC) support"
++        depends on MACH_X2000
++        select MMC_SDHCI
++        help
++          This selects the Ingenic XBurst2 SD/MMC Card Controller MSC.
++          If you have platform with a SD/Multimedia Card slot and compact
++          with this version, say Y or M here.
++          If unsure, say N.
+ 
+ config MMC_ARMMMCI
+ 	tristate "ARM AMBA Multimedia Card Interface support"
+@@ -842,11 +843,43 @@ config MMC_JZ4740
+ 	depends on MIPS
+ 	help
+ 	  This selects support for the SD/MMC controller on Ingenic
+-	  JZ4740, JZ4750, JZ4770 and JZ4780 SoCs.
++	  JZ4740, JZ4750, JZ4770 and JZ4780 SoCs. It also works on the
++	  X series in PIO mode and can be used for reducing the kernel
++	  image size.
++
++	  If you have a board based on such a SoC and with a SD/MMC slot,
++	  say Y or M here.
++
++config MMC_INGENIC
++	tristate "Ingenic X series SD/Multimedia Card Interface support"
++	depends on MIPS
++	select DMA_ENGINE
++	help
++	  This selects support for the SD/MMC controller on Ingenic
++	  X1000, X1600 and X1800 series SoCs, which utilises busmastering
++	  DMA for much higher performance.
+ 
+ 	  If you have a board based on such a SoC and with a SD/MMC slot,
+ 	  say Y or M here.
+ 
++config MMC_INGENIC_DEBUG
++	bool "Enable debugging"
++	depends on MMC_INGENIC
++	help
++	  This is useful when you're trying to improve this driver, or you
++	  have a faulty SD/MMC card and you want to hear some big noises in
++	  the kernel log when it dies.
++
++config MMC_INGENIC_DMA_DESCS
++	depends on MMC_INGENIC
++	int "Number of DMA descriptors"
++	range 32 1024
++	default "128"
++	help
++	  One DMA descriptor maps to one sg list entry.
++
++	  If unsure, just use the default value (128).
++
+ config MMC_VUB300
+ 	tristate "VUB300 USB to SDIO/SD/MMC Host Controller support"
+ 	depends on USB
+
+diff --git a/drivers/mmc/host/Makefile b/drivers/mmc/host/Makefile
+index a693fa3d3f1c..5739dc42bea5 100644
+--- a/drivers/mmc/host/Makefile
++++ b/drivers/mmc/host/Makefile
+@@ -57,6 +57,7 @@ obj-$(CONFIG_MMC_DW_ROCKCHIP)	+= dw_mmc-rockchip.o
+ obj-$(CONFIG_MMC_DW_STARFIVE)	+= dw_mmc-starfive.o
+ obj-$(CONFIG_MMC_SH_MMCIF)	+= sh_mmcif.o
+ obj-$(CONFIG_MMC_JZ4740)	+= jz4740_mmc.o
++obj-$(CONFIG_MMC_INGENIC)	+= ingenic_mmc.o
+ obj-$(CONFIG_MMC_VUB300)	+= vub300.o
+ obj-$(CONFIG_MMC_USHC)		+= ushc.o
+ obj-$(CONFIG_MMC_WMT)		+= wmt-sdmmc.o
+@@ -79,6 +80,7 @@ obj-$(CONFIG_MMC_SDHCI_CADENCE)		+= sdhci-cadence.o
+ obj-$(CONFIG_MMC_SDHCI_ESDHC_MCF)       += sdhci-esdhc-mcf.o
+ obj-$(CONFIG_MMC_SDHCI_ESDHC_IMX)	+= sdhci-esdhc-imx.o
+ obj-$(CONFIG_MMC_SDHCI_DOVE)		+= sdhci-dove.o
++obj-$(CONFIG_MMC_SDHCI_INGENIC)		+= sdhci-ingenic.o
+ obj-$(CONFIG_MMC_SDHCI_TEGRA)		+= sdhci-tegra.o
+ obj-$(CONFIG_MMC_SDHCI_OF_ARASAN)	+= sdhci-of-arasan.o
+ obj-$(CONFIG_MMC_SDHCI_OF_ASPEED)	+= sdhci-of-aspeed.o
+
+diff --git a/drivers/mmc/host/ingenic_mmc.c b/drivers/mmc/host/ingenic_mmc.c
+new file mode 100644
+index 000000000000..7dcfebebcee5
+--- /dev/null
++++ b/drivers/mmc/host/ingenic_mmc.c
+@@ -0,0 +1,1527 @@
++/*
++ * Ingenic MMC/SD Controller driver
++ *
++ * Copyright (C) 2012 Ingenic Semiconductor Co., Ltd.
++ * Written by Large Dipper <ykli@ingenic.com>.
++ *
++ * Modified by qipengzhen <aric.pzqi@ingenic.com> 2016-04-21
++ *
++ * Copyright (C) 2023 SudoMaker, Ltd.
++ * Author: Reimu NotMoe <reimu@sudomaker.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/platform_device.h>
++#include <linux/pinctrl/consumer.h>
++#include <linux/mmc/host.h>
++#include <linux/mmc/card.h>
++#include <linux/mmc/mmc.h>
++#include <linux/mmc/sd.h>
++#include <linux/mmc/sdio.h>
++#include <linux/mmc/slot-gpio.h>
++#include <linux/scatterlist.h>
++#include <linux/dma-mapping.h>
++#include <linux/gpio.h>
++#include <linux/clk.h>
++#include <linux/regulator/consumer.h>
++#include <asm-generic/delay.h>
++
++#include <linux/slab.h>
++#include <linux/stat.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_gpio.h>
++#include <linux/of_device.h>
++#include <linux/clk-provider.h>
++
++#define	MSC_CTRL			0x000
++#define	MSC_STAT			0x004
++#define	MSC_CLKRT			0x008
++#define	MSC_CMDAT			0x00C
++#define	MSC_RESTO			0x010
++#define	MSC_RDTO			0x014
++#define	MSC_BLKLEN			0x018
++#define	MSC_NOB				0x01C
++#define	MSC_SNOB			0x020
++#define	MSC_IMASK			0x024
++#define	MSC_IFLG			0x028
++#define	MSC_CMD				0x02C
++#define	MSC_ARG				0x030
++#define	MSC_RES				0x034
++#define	MSC_RXFIFO			0x038
++#define	MSC_TXFIFO			0x03C
++#define	MSC_LPM				0x040
++#define	MSC_DMAC			0x044
++#define	MSC_DMANDA			0x048
++#define	MSC_DMADA			0x04C
++#define	MSC_DMALEN			0x050
++#define	MSC_DMACMD			0x054
++#define	MSC_CTRL2			0x058
++#define	MSC_RTCNT			0x05C
++#define	MSC_DEBUG			0x0FC
++
++/* MSC Clock and Control Register (MSC_CTRL) */
++#define CTRL_SEND_CCSD			(1 << 15)		/*send command completion signal disable to ceata */
++#define CTRL_SEND_AS_CCSD		(1 << 14)		/*send internally generated stop after sending ccsd */
++#define CTRL_EXIT_MULTIPLE		(1 << 7)
++#define CTRL_EXIT_TRANSFER		(1 << 6)
++#define CTRL_START_READWAIT		(1 << 5)
++#define CTRL_STOP_READWAIT		(1 << 4)
++#define CTRL_RESET			(1 << 3)
++#define CTRL_START_OP			(1 << 2)
++#define CTRL_CLOCK_SHF			0
++#define CTRL_CLOCK_MASK			(0x3 << CTRL_CLOCK_SHF)
++#define CTRL_CLOCK_STOP			(0x1 << CTRL_CLOCK_SHF)	/* Stop MMC/SD clock */
++#define CTRL_CLOCK_START		(0x2 << CTRL_CLOCK_SHF)	/* Start MMC/SD clock */
++
++/* MSC Control 2 Register (MSC_CTRL2) */
++#define	CTRL2_PIP_SHF			24
++#define	CTRL2_PIP_MASK			(0x1f << CTRL2_PIP_SHF)
++#define	CTRL2_RST_EN			(1 << 23)
++#define	CTRL2_STPRM			(1 << 4)
++#define	CTRL2_SVC			(1 << 3)
++#define	CTRL2_SMS_SHF			0
++#define	CTRL2_SMS_MASK			(0x7 << CTRL2_SMS_SHF)
++#define	CTRL2_SMS_DEFSPD		(0x0 << CTRL2_SMS_SHF)
++#define	CTRL2_SMS_HISPD			(0x1 << CTRL2_SMS_SHF)
++#define	CTRL2_SMS_SDR12			(0x2 << CTRL2_SMS_SHF)
++#define	CTRL2_SMS_SDR25			(0x3 << CTRL2_SMS_SHF)
++#define	CTRL2_SMS_SDR50			(0x4 << CTRL2_SMS_SHF)
++
++/* MSC Status Register (MSC_STAT) */
++#define STAT_AUTO_CMD12_DONE			(1 << 31)
++#define STAT_AUTO_CMD23_DONE			(1 << 30)
++#define STAT_SVS				(1 << 29)
++#define STAT_PIN_LEVEL_SHF			24
++#define STAT_PIN_LEVEL_MASK			(0x1f << STAT_PIN_LEVEL_SHF)
++#define STAT_BCE				(1 << 20)
++#define STAT_BDE				(1 << 19)
++#define STAT_BAE				(1 << 18)
++#define STAT_BAR				(1 << 17)
++#define STAT_IS_RESETTING			(1 << 15)
++#define STAT_SDIO_INT_ACTIVE			(1 << 14)
++#define STAT_PRG_DONE				(1 << 13)
++#define STAT_DATA_TRAN_DONE			(1 << 12)
++#define STAT_END_CMD_RES			(1 << 11)
++#define STAT_DATA_FIFO_AFULL			(1 << 10)
++#define STAT_IS_READWAIT			(1 << 9)
++#define STAT_CLK_EN				(1 << 8)
++#define STAT_DATA_FIFO_FULL			(1 << 7)
++#define STAT_DATA_FIFO_EMPTY			(1 << 6)
++#define STAT_CRC_RES_ERR			(1 << 5)
++#define STAT_CRC_READ_ERROR			(1 << 4)
++#define STAT_CRC_WRITE_ERROR_SHF		2
++#define STAT_CRC_WRITE_ERROR_MASK		(0x3 << STAT_CRC_WRITE_ERROR_SHF)
++#define STAT_CRC_WRITE_ERROR_NO			(0 << STAT_CRC_WRITE_ERROR_SHF)
++#define STAT_CRC_WRITE_ERROR			(1 << STAT_CRC_WRITE_ERROR_SHF)
++#define STAT_CRC_WRITE_ERROR_NOSTS		(2 << STAT_CRC_WRITE_ERROR_SHF)
++#define STAT_TIME_OUT_RES			(1 << 1)
++#define STAT_TIME_OUT_READ			(1 << 0)
++
++/* MSC Bus Clock Control Register (MSC_CLKRT) */
++#define	CLKRT_CLK_RATE_SHF	0
++#define	CLKRT_CLK_RATE_MASK	(0x7 << CLKRT_CLK_RATE_SHF)
++#define CLKRT_CLK_RATE_DIV_1	(0x0 << CLKRT_CLK_RATE_SHF)		/* CLK_SRC */
++#define CLKRT_CLK_RATE_DIV_2	(0x1 << CLKRT_CLK_RATE_SHF)		/* 1/2 of CLK_SRC */
++#define CLKRT_CLK_RATE_DIV_4	(0x2 << CLKRT_CLK_RATE_SHF)		/* 1/4 of CLK_SRC */
++#define CLKRT_CLK_RATE_DIV_8	(0x3 << CLKRT_CLK_RATE_SHF)		/* 1/8 of CLK_SRC */
++#define CLKRT_CLK_RATE_DIV_16	(0x4 << CLKRT_CLK_RATE_SHF)		/* 1/16 of CLK_SRC */
++#define CLKRT_CLK_RATE_DIV_32	(0x5 << CLKRT_CLK_RATE_SHF)		/* 1/32 of CLK_SRC */
++#define CLKRT_CLK_RATE_DIV_64	(0x6 << CLKRT_CLK_RATE_SHF)		/* 1/64 of CLK_SRC */
++#define CLKRT_CLK_RATE_DIV_128	(0x7 << CLKRT_CLK_RATE_SHF)		/* 1/128 of CLK_SRC */
++
++/* MSC Command Sequence Control Register (MSC_CMDAT) */
++#define	CMDAT_CCS_EXPECTED		(1 << 31)		/* interrupts are enabled in ce-ata */
++#define	CMDAT_READ_CEATA		(1 << 30)
++#define	CMDAT_DIS_BOOT			(1 << 27)
++#define	CMDAT_ENB_BOOT			(1 << 26)
++#define	CMDAT_EXP_BOOT_ACK		(1 << 25)
++#define	CMDAT_BOOT_MODE			(1 << 24)
++#define	CMDAT_AUTO_CMD23		(1 << 18)
++#define	CMDAT_SDIO_PRDT			(1 << 17)		/* exact 2 cycle */
++#define	CMDAT_AUTO_CMD12		(1 << 16)
++#define	CMDAT_RTRG_SHF			14
++#define CMDAT_RTRG_EQUALT_16		(0x0 << CMDAT_RTRG_SHF)	/*reset value*/
++#define CMDAT_RTRG_EQUALT_32		(0x1 << CMDAT_RTRG_SHF)
++#define CMDAT_RTRG_EQUALT_64		(0x2 << CMDAT_RTRG_SHF)
++#define CMDAT_RTRG_EQUALT_96		(0x3 << CMDAT_RTRG_SHF)
++#define	CMDAT_TTRG_SHF			12
++#define CMDAT_TTRG_LESS_16		(0x0 << CMDAT_TTRG_SHF)	/*reset value*/
++#define CMDAT_TTRG_LESS_32		(0x1 << CMDAT_TTRG_SHF)
++#define CMDAT_TTRG_LESS_64		(0x2 << CMDAT_TTRG_SHF)
++#define CMDAT_TTRG_LESS_96		(0x3 << CMDAT_TTRG_SHF)
++#define	CMDAT_IO_ABORT			(1 << 11)
++#define	CMDAT_BUS_WIDTH_SHF		9
++#define	CMDAT_BUS_WIDTH_MASK		(0x3 << CMDAT_BUS_WIDTH_SHF)
++#define CMDAT_BUS_WIDTH_1BIT		(0x0 << CMDAT_BUS_WIDTH_SHF)	/* 1-bit data bus */
++#define CMDAT_BUS_WIDTH_4BIT		(0x2 << CMDAT_BUS_WIDTH_SHF)	/* 4-bit data bus */
++#define CMDAT_BUS_WIDTH_8BIT		(0x3 << CMDAT_BUS_WIDTH_SHF)	/* 8-bit data bus */
++#define	CMDAT_INIT			(1 << 7)
++#define	CMDAT_BUSY			(1 << 6)
++#define	CMDAT_STREAM_BLOCK		(1 << 5)
++#define	CMDAT_WRITE_READ		(1 << 4)
++#define	CMDAT_DATA_EN			(1 << 3)
++#define	CMDAT_RESPONSE_SHF		0
++#define	CMDAT_RESPONSE_MASK		(0x7 << CMDAT_RESPONSE_SHF)
++#define CMDAT_RESPONSE_NONE 		(0x0 << CMDAT_RESPONSE_SHF)		/* No response */
++#define CMDAT_RESPONSE_R1		(0x1 << CMDAT_RESPONSE_SHF)		/* Format R1 and R1b */
++#define CMDAT_RESPONSE_R2	  	(0x2 << CMDAT_RESPONSE_SHF)		/* Format R2 */
++#define CMDAT_RESPONSE_R3	  	(0x3 << CMDAT_RESPONSE_SHF)		/* Format R3 */
++#define CMDAT_RESPONSE_R4	  	(0x4 << CMDAT_RESPONSE_SHF)		/* Format R4 */
++#define CMDAT_RESPONSE_R5	  	(0x5 << CMDAT_RESPONSE_SHF)		/* Format R5 */
++#define CMDAT_RESPONSE_R6	  	(0x6 << CMDAT_RESPONSE_SHF)		/* Format R6 */
++#define CMDAT_RESRONSE_R7		(0x7 << CMDAT_RESPONSE_SHF)		/* Format R7 */
++
++/* MSC Interrupts Mask Register (MSC_IMASK) */
++#define	IMASK_DMA_DATA_DONE		(1 << 31)
++#define	IMASK_WR_ALL_DONE		(1 << 23)
++#define	IMASK_AUTO_CMD23_DONE		(1 << 30)
++#define	IMASK_SVS			(1 << 29)
++#define	IMASK_PIN_LEVEL_SHF		24
++#define	IMASK_PIN_LEVEL_MASK		(0x1f << IMASK_PIN_LEVEL_SHF)
++#define	IMASK_BCE			(1 << 20)
++#define	IMASK_BDE			(1 << 19)
++#define	IMASK_BAE			(1 << 18)
++#define	IMASK_BAR			(1 << 17)
++#define	IMASK_DMAEND			(1 << 16)
++#define	IMASK_AUTO_CMD12_DONE		(1 << 15)
++#define	IMASK_DATA_FIFO_FULL		(1 << 14)
++#define	IMASK_DATA_FIFO_EMP		(1 << 13)
++#define	IMASK_CRC_RES_ERR		(1 << 12)
++#define	IMASK_CRC_READ_ERR		(1 << 11)
++#define	IMASK_CRC_WRITE_ERR		(1 << 10)
++#define	IMASK_TIME_OUT_RES		(1 << 9)
++#define	IMASK_TIME_OUT_READ		(1 << 8)
++#define	IMASK_SDIO			(1 << 7)
++#define	IMASK_TXFIFO_WR_REQ		(1 << 6)
++#define	IMASK_RXFIFO_RD_REQ		(1 << 5)
++#define	IMASK_END_CMD_RES		(1 << 2)
++#define	IMASK_PRG_DONE			(1 << 1)
++#define	IMASK_DATA_TRAN_DONE		(1 << 0)
++
++/* MSC Interrupts Status Register (MSC_IREG) */
++#define	IFLG_DMA_DATA_DONE		(1 << 31)
++#define	IFLG_WR_ALL_DONE		(1 << 23)
++#define	IFLG_AUTO_CMD23_DONE		(1 << 30)
++#define	IFLG_SVS			(1 << 29)
++#define	IFLG_PIN_LEVEL_SHF		24
++#define	IFLG_PIN_LEVEL_MASK		(0x1f << IFLG_PIN_LEVEL_SHF)
++#define	IFLG_BCE			(1 << 20)
++#define	IFLG_BDE			(1 << 19)
++#define	IFLG_BAE			(1 << 18)
++#define	IFLG_BAR			(1 << 17)
++#define	IFLG_DMAEND			(1 << 16)
++#define	IFLG_AUTO_CMD12_DONE		(1 << 15)
++#define	IFLG_DATA_FIFO_FULL		(1 << 14)
++#define	IFLG_DATA_FIFO_EMP		(1 << 13)
++#define	IFLG_CRC_RES_ERR		(1 << 12)
++#define	IFLG_CRC_READ_ERR		(1 << 11)
++#define	IFLG_CRC_WRITE_ERR		(1 << 10)
++#define	IFLG_TIMEOUT_RES		(1 << 9)
++#define	IFLG_TIMEOUT_READ		(1 << 8)
++#define	IFLG_SDIO			(1 << 7)
++#define	IFLG_TXFIFO_WR_REQ		(1 << 6)
++#define	IFLG_RXFIFO_RD_REQ		(1 << 5)
++#define	IFLG_END_CMD_RES		(1 << 2)
++#define	IFLG_PRG_DONE			(1 << 1)
++#define	IFLG_DATA_TRAN_DONE		(1 << 0)
++
++/* MSC Low Power Mode Register (MSC_LPM) */
++#define	LPM_DRV_SEL_SHF			30
++#define	LPM_DRV_SEL_MASK		(0x3 << LPM_DRV_SEL_SHF)
++#define	LPM_SMP_SEL			(1 << 29)
++#define	LPM_LPM				(1 << 0)
++
++/* MSC DMA Control Register (MSC_DMAC) */
++#define	DMAC_MODE_SEL		(1 << 7)
++#define	DMAC_AOFST_SHF		5
++#define	DMAC_AOFST_MASK		(0x3 << DMAC_AOFST_SHF)
++#define	DMAC_AOFST_0		(0 << DMAC_AOFST_SHF)
++#define	DMAC_AOFST_1		(1 << DMAC_AOFST_SHF)
++#define	DMAC_AOFST_2		(2 << DMAC_AOFST_SHF)
++#define	DMAC_AOFST_3		(3 << DMAC_AOFST_SHF)
++#define	DMAC_ALIGNEN		(1 << 4)
++#define	DMAC_INCR_SHF		2
++#define	DMAC_INCR_MASK		(0x3 << DMAC_INCR_SHF)
++#define	DMAC_INCR_16		(0 << DMAC_INCR_SHF)
++#define	DMAC_INCR_32		(1 << DMAC_INCR_SHF)
++#define	DMAC_INCR_64		(2 << DMAC_INCR_SHF)
++#define	DMAC_DMASEL		(1 << 1)
++#define	DMAC_DMAEN		(1 << 0)
++
++/* MSC DMA Command Register (MSC_DMACMD) */
++#define	DMACMD_IDI_SHF			24
++#define	DMACMD_IDI_MASK			(0xff << DMACMD_IDI_SHF)
++#define	DMACMD_ID_SHF			16
++#define	DMACMD_ID_MASK			(0xff << DMACMD_ID_SHF)
++#define	DMACMD_OFFSET_SHF		9
++#define	DMACMD_OFFSET_MASK		(0x3 << DMACMD_OFFSET_SHF)
++#define	DMACMD_ALIGN_EN			(1 << 8)
++#define	DMACMD_ENDI			(1 << 1)
++#define	DMACMD_LINK			(1 << 0)
++
++
++enum {
++	EVENT_CMD_COMPLETE = 0,
++	EVENT_TRANS_COMPLETE,
++	EVENT_DMA_COMPLETE,
++	EVENT_DATA_COMPLETE,
++	EVENT_STOP_COMPLETE,
++	EVENT_ERROR,
++};
++
++enum ingenic_mmc_state {
++	STATE_IDLE = 0,
++	STATE_WAITING_RESP,
++	STATE_WAITING_DATA,
++	STATE_SENDING_STOP,
++	STATE_ERROR,
++};
++
++struct sdma_desc {
++	volatile u32 nda;
++	volatile u32 da;
++	volatile u32 len;
++	volatile u32 dcmd;
++};
++
++struct desc_hd {
++	struct sdma_desc *dma_desc;
++	dma_addr_t dma_desc_phys_addr;
++	struct desc_hd *next;
++};
++
++/**
++ * struct ingenic_mmc_host - Ingenic MMC/SD Controller host structure
++ * @pdata: The platform data.
++ * @dev: The mmc device pointer.
++ * @irq: Interrupt of MSC.
++ * @clk: Main Clk of MSC, including cgu and clk gate.
++ * @pwc_clk: Power of MSC module, MSC register can be access when pwc_clk on.
++ * @power: Power regulator of SD/MMC attached to SD slot.
++ * @mrq: mmc_request pointer which includes all the information
++ *	of the current request, or NULL when the host is idle.
++ * @cmd: Command information of mmc_request.
++ * @data: Data information of mmc_request, or NULL when mrq without
++ *	data request.
++ * @mmc: The mmc_host representing this slot.
++ * @pending_events: Bitmask of events flagged by the interrupt handler
++ *	to be processed by the state machine.
++ * @iomem: Pointer to MSC registers.
++ * @request_timer: Timer used for preventing request time out.
++ * @flags: Random state bits associated with the slot.
++ * @cmdat: Variable for MSC_CMDAT register.
++ * @cmdat_def: Defalt CMDAT register value for every request.
++ * @gpio: Information of gpio including cd, wp and pwr.
++ * @index: Number of each MSC host.
++ * @decshds[]: Descriptor DMA information structure.
++ * @state: It's the state for request.
++ * @list: List head for manually detect card such as wifi.
++ * @lock: Lock the registers operation.
++ * @double_enter: Prevent state machine reenter.
++ * @timeout_cnt: The count of timeout second.
++ */
++#define MAX_DMA_DESCS			CONFIG_MMC_INGENIC_DMA_DESCS	/* max count of sg */
++//#define INGENIC_MMC_CARD_PRESENT	0
++#define INGENIC_MMC_CARD_NEED_INIT	1
++#define INGENIC_MMC_USE_PIO		2
++#define INGENIC_MMC_IS_SDIO		3
++
++struct ingenic_mmc_host {
++	void __iomem				*iomem;
++	struct device				*dev;
++	struct clk				*clk;
++	struct mmc_request			*mrq;
++	struct mmc_command			*cmd;
++	struct mmc_data				*data;
++	struct mmc_host				*mmc;
++	struct timer_list			request_timer;
++	struct tasklet_struct			tasklet;
++	struct sdma_desc			*dma_descs;
++	dma_addr_t				dma_descs_phys;
++	enum ingenic_mmc_state			state;
++	spinlock_t				lock;
++	unsigned long				pending_events;
++	unsigned long				flags;
++	unsigned int				cmdat;
++	unsigned int				cmdat_def;
++	unsigned int				index;
++	unsigned int				double_enter;
++	int					timeout_cnt;
++	int					irq;
++};
++
++struct ingenic_mmc_priv {
++	void (*get_clk_name)(int id, char *cgu_name, char *gate_name);
++};
++
++/* Register access macros */
++#define msc_readl(port,reg)						\
++	readl((port)->iomem + MSC_##reg)
++#define msc_writel(port,reg,value)				\
++	writel((value), (port)->iomem + MSC_##reg)
++
++
++/**
++ * MMC driver parameters
++ */
++#define TIMEOUT_PERIOD		3000	/* msc operation timeout detect period */
++#define PIO_THRESHOLD		64	/* use pio mode if data length < PIO_THRESHOLD */
++#define CLK_CTRL
++
++#define ERROR_IFLG (							\
++		IFLG_CRC_RES_ERR	|				\
++		IFLG_CRC_READ_ERR	|				\
++		IFLG_CRC_WRITE_ERR	|				\
++		IFLG_TIMEOUT_RES	|				\
++		IFLG_TIMEOUT_READ)
++
++/*
++ * Error status including CRC_READ_ERROR, CRC_WRITE_ERROR,
++ * CRC_RES_ERR, TIME_OUT_RES, TIME_OUT_READ
++ */
++#define ERROR_STAT		0x3f
++
++#define ingenic_mmc_check_pending(host, event)		\
++	test_and_clear_bit(event, &host->pending_events)
++#define ingenic_mmc_set_pending(host, event)			\
++	set_bit(event, &host->pending_events)
++#define is_pio_mode(host)						\
++	(host->flags & (1 << INGENIC_MMC_USE_PIO))
++#define enable_pio_mode(host)					\
++	(host->flags |= (1 << INGENIC_MMC_USE_PIO))
++#define disable_pio_mode(host)					\
++	(host->flags &= ~(1 << INGENIC_MMC_USE_PIO))
++
++static LIST_HEAD(manual_list);
++
++/*-------------------End structure and macro define------------------------*/
++
++
++static void ingenic_mmc_dump_reg(struct ingenic_mmc_host *host)
++{
++#ifdef CONFIG_MMC_INGENIC_DEBUG
++	dev_info(host->dev,"\nREG dump:\n"
++			 "\tCTRL2\t= 0x%08X\n"
++			 "\tSTAT\t= 0x%08X\n"
++			 "\tCLKRT\t= 0x%08X\n"
++			 "\tCMDAT\t= 0x%08X\n"
++			 "\tRESTO\t= 0x%08X\n"
++			 "\tRDTO\t= 0x%08X\n"
++			 "\tBLKLEN\t= 0x%08X\n"
++			 "\tNOB\t= 0x%08X\n"
++			 "\tSNOB\t= 0x%08X\n"
++			 "\tIMASK\t= 0x%08X\n"
++			 "\tIFLG\t= 0x%08X\n"
++			 "\tCMD\t= 0x%08X\n"
++			 "\tARG\t= 0x%08X\n"
++			 "\tRES\t= 0x%08X\n"
++			 "\tLPM\t= 0x%08X\n"
++			 "\tDMAC\t= 0x%08X\n"
++			 "\tDMANDA\t= 0x%08X\n"
++			 "\tDMADA\t= 0x%08X\n"
++			 "\tDMALEN\t= 0x%08X\n"
++			 "\tDMACMD\t= 0x%08X\n"
++			 "\tRTCNT\t= 0x%08X\n"
++			 "\tDEBUG\t= 0x%08X\n",
++
++			 msc_readl(host, CTRL2),
++			 msc_readl(host, STAT),
++			 msc_readl(host, CLKRT),
++			 msc_readl(host, CMDAT),
++			 msc_readl(host, RESTO),
++			 msc_readl(host, RDTO),
++			 msc_readl(host, BLKLEN),
++			 msc_readl(host, NOB),
++			 msc_readl(host, SNOB),
++			 msc_readl(host, IMASK),
++			 msc_readl(host, IFLG),
++			 msc_readl(host, CMD),
++			 msc_readl(host, ARG),
++			 msc_readl(host, RES),
++			 msc_readl(host, LPM),
++			 msc_readl(host, DMAC),
++			 msc_readl(host, DMANDA),
++			 msc_readl(host, DMADA),
++			 msc_readl(host, DMALEN),
++			 msc_readl(host, DMACMD),
++			 msc_readl(host, RTCNT),
++			 msc_readl(host, DEBUG));
++#endif
++}
++
++
++/*
++ * Functional functions.
++ *
++ * These small function will be called frequently.
++ */
++static inline void enable_msc_irq(struct ingenic_mmc_host *host, unsigned long bits)
++{
++	unsigned long imsk;
++
++	spin_lock_bh(&host->lock);
++	imsk = msc_readl(host, IMASK);
++	imsk &= ~bits;
++	msc_writel(host, IMASK, imsk);
++	spin_unlock_bh(&host->lock);
++}
++
++static inline void clear_msc_irq(struct ingenic_mmc_host *host, unsigned long bits)
++{
++	msc_writel(host, IFLG, bits);
++}
++
++static inline void disable_msc_irq(struct ingenic_mmc_host *host, unsigned long bits)
++{
++	unsigned long imsk;
++
++	spin_lock_bh(&host->lock);
++	imsk = msc_readl(host, IMASK);
++	imsk |= bits;
++	msc_writel(host, IMASK, imsk);
++	spin_unlock_bh(&host->lock);
++}
++
++static void ingenic_mmc_reset(struct ingenic_mmc_host *host)
++{
++	unsigned int clkrt = msc_readl(host, CLKRT);
++	unsigned int cnt = 1000;
++	int vl;
++
++	msc_writel(host, CTRL, CTRL_RESET);
++	vl = msc_readl(host,CTRL);
++	vl &= ~CTRL_RESET;
++	msc_writel(host, CTRL, vl);
++
++	while ((msc_readl(host, STAT) & STAT_IS_RESETTING) && (--cnt));
++
++	if (host->flags & INGENIC_MMC_IS_SDIO)
++		msc_writel(host, CTRL, CTRL_CLOCK_START);
++	else
++		msc_writel(host, LPM, LPM_LPM);
++
++	msc_writel(host, IMASK, 0xffffffff);
++	msc_writel(host, IFLG, 0xffffffff);
++
++	msc_writel(host, CLKRT, clkrt);
++}
++
++static inline void ingenic_mmc_stop_dma(struct ingenic_mmc_host *host)
++{
++	dev_warn(host->dev, "%s\n", __func__);
++
++	/*
++	 * Theoretically, DMA can't be stopped when transfering, so we can only
++	 * diable it when it is out of DMA request.
++	 */
++	msc_writel(host, DMAC, 0);
++}
++
++static inline int request_need_stop(struct mmc_request *mrq)
++{
++	return mrq->stop ? 1 : 0;
++}
++
++static inline void ingenic_mmc_clk_onoff(struct ingenic_mmc_host *host, unsigned int on)
++{
++	if (on) {
++		clk_prepare_enable(host->clk);
++	} else {
++		clk_disable_unprepare(host->clk);
++	}
++}
++
++static inline int check_error_status(struct ingenic_mmc_host *host, unsigned int status)
++{
++	if (status & ERROR_STAT) {
++		dev_err(host->dev, "Error status->0x%08X: cmd=%d, state=%d\n",
++				status, host->cmd->opcode, host->state);
++		return -1;
++	}
++	return 0;
++}
++
++static int ingenic_mmc_polling_status(struct ingenic_mmc_host *host, unsigned int status)
++{
++	unsigned int cnt = 1000 * 1000;
++	while(!(msc_readl(host, STAT) & (status | ERROR_STAT))				\
++	      && (--cnt));
++
++	if (unlikely(!cnt)) {
++		dev_err(host->dev, "polling status(0x%08X) time out, "
++				"op=%d, status=0x%08X\n", status,
++				host->cmd->opcode, msc_readl(host, STAT));
++		return -1;
++	}
++
++	if (msc_readl(host, STAT) & ERROR_STAT) {
++		dev_err(host->dev, "polling status(0x%08X) error, "
++				"op=%d, status=0x%08X\n", status,
++				host->cmd->opcode, msc_readl(host, STAT));
++		return -1;
++	}
++
++	return 0;
++}
++
++static void send_stop_command(struct ingenic_mmc_host *host)
++{
++	struct mmc_command *stop_cmd = host->mrq->stop;
++
++	msc_writel(host, CMD, stop_cmd->opcode);
++	msc_writel(host, ARG, stop_cmd->arg);
++	msc_writel(host, CMDAT, CMDAT_BUSY | CMDAT_RESPONSE_R1);
++	msc_writel(host, RESTO, 0xff);
++	msc_writel(host, CTRL, CTRL_START_OP);
++
++	if (ingenic_mmc_polling_status(host, STAT_END_CMD_RES))
++		stop_cmd->error = -EIO;
++}
++static void ingenic_mmc_command_done(struct ingenic_mmc_host *host, struct mmc_command *cmd)
++{
++	unsigned long res;
++
++	if ((host->cmdat & CMDAT_RESPONSE_MASK) == CMDAT_RESPONSE_R2) {
++		int i;
++		res = msc_readl(host, RES);
++		for (i = 0 ; i < 4 ; i++) {
++			cmd->resp[i] = res << 24;
++			res = msc_readl(host, RES);
++			cmd->resp[i] |= res << 8;
++			res = msc_readl(host, RES);
++			cmd->resp[i] |= res >> 8;
++		}
++	} else {
++		res = msc_readl(host, RES);
++		cmd->resp[0] = res << 24;
++		res = msc_readl(host, RES);
++		cmd->resp[0] |= res << 8;
++		res = msc_readl(host, RES);
++		cmd->resp[0] |= res & 0xff;
++	}
++
++	clear_msc_irq(host, IFLG_END_CMD_RES);
++}
++
++static void ingenic_mmc_data_done(struct ingenic_mmc_host *host)
++{
++	struct mmc_data *data = host->data;
++
++	if (data->error == 0)
++		data->bytes_xfered = (data->blocks * data->blksz);
++	else {
++		ingenic_mmc_stop_dma(host);
++		data->bytes_xfered = 0;
++		dev_err(host->dev, "error when request done\n");
++	}
++
++	del_timer_sync(&host->request_timer);
++	mmc_request_done(host->mmc, host->mrq);
++}
++
++/*------------------------End functional functions-------------------------*/
++
++/*
++ * State machine.
++ *
++ * The state machine is the manager of the mmc_request. It's triggered by
++ * MSC interrupt and work in interrupt context.
++ */
++static void ingenic_mmc_state_machine(struct ingenic_mmc_host *host, unsigned int status)
++{
++	struct mmc_request *mrq = host->mrq;
++	struct mmc_data *data = host->data;
++
++	WARN_ON(host->double_enter++);
++start:
++	dev_dbg(host->dev, "enter state: %d\n", host->state);
++
++	switch (host->state) {
++	case STATE_IDLE:
++		dev_warn(host->dev, "WARN: enter state machine with IDLE\n");
++		break;
++
++	case STATE_WAITING_RESP:
++		if (!ingenic_mmc_check_pending(host, EVENT_CMD_COMPLETE))
++			break;
++		if (unlikely(check_error_status(host, status) != 0)) {
++			host->state = STATE_ERROR;
++			clear_msc_irq(host, IFLG_CRC_RES_ERR
++						  | IFLG_TIMEOUT_RES
++						  | IFLG_END_CMD_RES);
++			goto start;
++		}
++		ingenic_mmc_command_done(host, mrq->cmd);
++		if (!data) {
++			host->state = STATE_IDLE;
++			del_timer_sync(&host->request_timer);
++			mmc_request_done(host->mmc, host->mrq);
++			break;
++		}
++		host->state = STATE_WAITING_DATA;
++		break;
++
++	case STATE_WAITING_DATA:
++		if (!ingenic_mmc_check_pending(host, EVENT_DATA_COMPLETE))
++			break;
++		if (unlikely(check_error_status(host, status) != 0)) {
++			clear_msc_irq(host, IFLG_DATA_TRAN_DONE
++						  | IFLG_CRC_READ_ERR
++						  | IFLG_CRC_WRITE_ERR
++						  | IFLG_TIMEOUT_READ);
++			if (request_need_stop(host->mrq))
++				send_stop_command(host);
++			host->state = STATE_ERROR;
++			goto start;
++		}
++
++		if (request_need_stop(host->mrq)) {
++			if (likely(msc_readl(host, STAT) & STAT_AUTO_CMD12_DONE)) {
++				disable_msc_irq(host, IMASK_AUTO_CMD12_DONE);
++				clear_msc_irq(host, IFLG_AUTO_CMD12_DONE);
++				host->state = STATE_IDLE;
++				ingenic_mmc_data_done(host);
++			} else {
++				enable_msc_irq(host, IMASK_AUTO_CMD12_DONE);
++				if (msc_readl(host, STAT) & STAT_AUTO_CMD12_DONE) {
++					disable_msc_irq(host, IMASK_AUTO_CMD12_DONE);
++					clear_msc_irq(host, IFLG_AUTO_CMD12_DONE);
++					host->state = STATE_IDLE;
++					ingenic_mmc_data_done(host);
++				} else
++					host->state = STATE_SENDING_STOP;
++			}
++		} else {
++			host->state = STATE_IDLE;
++			ingenic_mmc_data_done(host);
++		}
++		break;
++
++	case STATE_SENDING_STOP:
++		if (!ingenic_mmc_check_pending(host, EVENT_STOP_COMPLETE))
++			break;
++		host->state = STATE_IDLE;
++		ingenic_mmc_data_done(host);
++		break;
++
++	case STATE_ERROR:
++		if (host->state == STATE_WAITING_DATA)
++			host->data->error = -1;
++		host->cmd->error = -1;
++
++		if (data) {
++			data->bytes_xfered = 0;
++			/* Whether should we stop DMA here? */
++		}
++		del_timer_sync(&host->request_timer);
++		host->state = STATE_IDLE;
++		mmc_request_done(host->mmc, host->mrq);
++		break;
++	}
++
++	dev_dbg(host->dev, "exit state: %d\n", host->state);
++	host->double_enter--;
++}
++
++static irqreturn_t ingenic_mmc_thread_handle(int irq, void *dev_id)
++{
++	struct ingenic_mmc_host *host = (struct ingenic_mmc_host *)dev_id;
++	unsigned int iflg, imask, pending, status;
++
++start:
++	iflg = msc_readl(host, IFLG);
++	imask = msc_readl(host, IMASK);
++	pending = iflg & ~imask;
++	status = msc_readl(host, STAT);
++	dev_dbg(host->dev, "%s: iflg-0x%08X imask-0x%08X status-0x%08X\n",
++			__func__, iflg, imask, status);
++
++	if (!pending) {
++		goto out;
++	} else if (pending & IFLG_SDIO) {
++		mmc_signal_sdio_irq(host->mmc);
++		goto out;
++	} else if (pending & ERROR_IFLG) {
++		unsigned int mask = ERROR_IFLG;
++
++		dev_dbg(host->dev, "%s: iflg-0x%08X imask-0x%08X status-0x%08X\n",
++				__func__, iflg, imask, status);
++
++		dev_dbg(host->dev, "err%d cmd%d iflg%08X status%08X\n",
++				host->state, host->cmd ? host->cmd->opcode : -1, iflg, status);
++
++		if (host->state == STATE_WAITING_RESP)
++			mask |= IMASK_END_CMD_RES;
++		else if (host->state == STATE_WAITING_DATA)
++			mask |= IMASK_WR_ALL_DONE | IMASK_DMA_DATA_DONE;
++
++		clear_msc_irq(host, mask);
++		disable_msc_irq(host, mask);
++
++		/*
++		 * It seems that cmd53 CRC error occurs frequently
++		 * at 50mHz clk, but it disappear at 40mHz. In case of
++		 * it happens, we add retry here to try to fix the error.
++		 */
++		if ((host->cmd->opcode == 53)
++		    && (status & STAT_CRC_READ_ERROR)) {
++			dev_err(host->dev, "cmd53 crc error, retry.\n");
++			host->cmd->error = -1;
++			host->cmd->retries = 1;
++			host->data->bytes_xfered = 0;
++			del_timer_sync(&host->request_timer);
++			host->state = STATE_IDLE;
++			mmc_request_done(host->mmc, host->mrq);
++			goto out;
++		}
++		host->state = STATE_ERROR;
++		ingenic_mmc_state_machine(host, status);
++		goto out;
++
++	} else if (pending & IFLG_END_CMD_RES) {
++		ingenic_mmc_set_pending(host, EVENT_CMD_COMPLETE);
++		disable_msc_irq(host, IMASK_END_CMD_RES |		\
++						IMASK_CRC_RES_ERR | IMASK_TIME_OUT_RES);
++		ingenic_mmc_state_machine(host, status);
++	} else if (pending & IFLG_WR_ALL_DONE) {
++		ingenic_mmc_set_pending(host, EVENT_DATA_COMPLETE);
++		clear_msc_irq(host, IFLG_WR_ALL_DONE
++					  | IFLG_DMAEND
++					  | IFLG_DATA_TRAN_DONE
++					  | IFLG_PRG_DONE);
++		disable_msc_irq(host, IMASK_WR_ALL_DONE | IMASK_CRC_WRITE_ERR);
++		ingenic_mmc_state_machine(host, status);
++
++	} else if (pending & IFLG_DMA_DATA_DONE) {
++		ingenic_mmc_set_pending(host, EVENT_DATA_COMPLETE);
++		clear_msc_irq(host, IFLG_DATA_TRAN_DONE | IFLG_DMAEND |
++					  IFLG_DMA_DATA_DONE);
++		disable_msc_irq(host, IMASK_DMA_DATA_DONE | IMASK_CRC_READ_ERR);
++		ingenic_mmc_state_machine(host, status);
++	} else if (pending & IFLG_AUTO_CMD12_DONE) {
++		ingenic_mmc_set_pending(host, EVENT_STOP_COMPLETE);
++		clear_msc_irq(host, IFLG_AUTO_CMD12_DONE);
++		disable_msc_irq(host, IMASK_AUTO_CMD12_DONE);
++		ingenic_mmc_state_machine(host, status);
++
++	} else
++		dev_warn(host->dev, "state-%d: Nothing happens?!\n", host->state);
++
++	/*
++	 * Check if the status has already changed. If so, goto start so that
++	 * we can avoid an interrupt.
++	 */
++	if (status != msc_readl(host, STAT)) {
++		goto start;
++	}
++
++out:
++	return IRQ_HANDLED;
++}
++/*--------------------------End state machine------------------------------*/
++
++/*
++ * DMA handler.
++ *
++ * Descriptor DMA transfer that can handle scatter gather list directly
++ * without bounce buffer which may cause a big deal of memcpy.
++ */
++static inline void sg_to_desc(struct scatterlist *sgentry, struct sdma_desc *sd)
++{
++	sd->da = sg_phys(sgentry);
++	sd->len = sg_dma_len(sgentry);
++	sd->dcmd = DMACMD_LINK;
++}
++
++static void ingenic_mmc_submit_dma(struct ingenic_mmc_host *host, struct mmc_data *data)
++{
++	unsigned i = 0;
++	struct scatterlist *sgentry;
++	struct sdma_desc *sd = host->dma_descs;
++
++	if (data->sg_len > MAX_DMA_DESCS) {
++		dev_err(host->dev, "logic error: sg_len too large\n");
++		BUG();
++	}
++
++	dma_map_sg(host->dev, data->sg, data->sg_len,
++			   data->flags & MMC_DATA_WRITE
++			   ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
++
++	for_each_sg(data->sg, sgentry, data->sg_len, i) {
++		sg_to_desc(sgentry, sd);
++		sd++;
++	}
++
++	dma_unmap_sg(host->dev, data->sg, data->sg_len,
++				 data->flags & MMC_DATA_WRITE
++				 ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
++
++	if (data->sg_len) {
++		sd[-1].dcmd |= DMACMD_ENDI;
++		sd[-1].dcmd &= ~DMACMD_LINK;
++	}
++}
++
++static inline unsigned int get_incr(unsigned int dma_len)
++{
++	return 2;
++}
++
++static inline void ingenic_mmc_dma_start(struct ingenic_mmc_host *host, struct mmc_data *data)
++{
++	dma_addr_t dma_addr = sg_phys(data->sg);
++	unsigned int dma_len = sg_dma_len(data->sg);
++	unsigned int dmac;
++
++	dmac = (get_incr(dma_len) << DMAC_INCR_SHF) | DMAC_DMAEN;
++
++	if ((dma_addr & 0x3) || (dma_len & 0x3)) {
++		dmac |= DMAC_ALIGNEN;
++		if (dma_addr & 0x3)
++			dmac |= (dma_addr % 4) << DMAC_AOFST_SHF;
++	}
++
++	msc_writel(host, DMANDA, host->dma_descs_phys);
++	msc_writel(host, DMAC, dmac);
++}
++
++/*----------------------------End DMA handler------------------------------*/
++
++/*
++ * PIO transfer mode.
++ *
++ * Functions of PIO read/write mode that can handle 1, 2 or 3 bytes transfer
++ * even though the FIFO register is 32-bits width.
++ * It's better just used for test.
++ */
++static int wait_cmd_response(struct ingenic_mmc_host *host)
++{
++	if (ingenic_mmc_polling_status(host, STAT_END_CMD_RES) < 0) {
++		dev_err(host->dev, "PIO mode: command response error\n");
++		return -1;
++	}
++	msc_writel(host, IFLG, IFLG_END_CMD_RES);
++	return 0;
++}
++
++static void do_pio_read(struct ingenic_mmc_host *host,
++						unsigned int *addr, unsigned int cnt)
++{
++	int i = 0;
++	unsigned int status = 0;
++
++	for (i = 0; i < cnt / 4; i++) {
++		while ((status = msc_readl(host, STAT)) & STAT_DATA_FIFO_EMPTY);
++
++		if (check_error_status(host, status)) {
++			host->data->error = -1;
++			return;
++		}
++		*addr++ = msc_readl(host, RXFIFO);
++	}
++
++	/*
++	 * These codes handle the last 1, 2 or 3 bytes transfer.
++	 */
++	if (cnt & 3) {
++		u32 n = cnt & 3;
++		u32 data = msc_readl(host, RXFIFO);
++		u8 *p = (u8 *)addr;
++
++		while (n--) {
++			*p++ = data;
++			data >>= 8;
++		}
++	}
++}
++
++static void do_pio_write(struct ingenic_mmc_host *host,
++						 unsigned int *addr, unsigned int cnt)
++{
++	int i = 0;
++	unsigned int status = 0;
++
++	for (i = 0; i < (cnt / 4); i++) {
++		while ((status = msc_readl(host, STAT)) & STAT_DATA_FIFO_FULL);
++
++		if (check_error_status(host, status)) {
++			host->data->error = -1;
++			return;
++		}
++
++		msc_writel(host, TXFIFO, *addr++);
++	}
++
++	/*
++	 * These codes handle the last 1, 2 or 3 bytes transfer.
++	 */
++	if (cnt & 3) {
++		u32 data = 0;
++		u8 *p = (u8 *)addr;
++
++		for (i = 0; i < (cnt & 3); i++)
++			data |= *p++ << (8 * i);
++
++		msc_writel(host, TXFIFO, data);
++	}
++}
++
++static inline void pio_trans_start(struct ingenic_mmc_host *host, struct mmc_data *data)
++{
++	unsigned int *addr = sg_virt(data->sg);
++	unsigned int cnt = sg_dma_len(data->sg);
++
++	if (data->flags & MMC_DATA_WRITE)
++		do_pio_write(host, addr, cnt);
++	else
++		do_pio_read(host, addr, cnt);
++}
++
++static void pio_trans_done(struct ingenic_mmc_host *host, struct mmc_data *data)
++{
++	if (data->error == 0)
++		data->bytes_xfered = data->blocks * data->blksz;
++	else
++		data->bytes_xfered = 0;
++
++	if (host->mrq->stop) {
++		if (ingenic_mmc_polling_status(host, STAT_AUTO_CMD12_DONE) < 0)
++			data->error = -EIO;
++	}
++
++	if (data->flags & MMC_DATA_WRITE) {
++		if (ingenic_mmc_polling_status(host, STAT_PRG_DONE) < 0) {
++			data->error = -EIO;
++		}
++		clear_msc_irq(host, IFLG_PRG_DONE);
++	} else {
++		if (ingenic_mmc_polling_status(host, STAT_DATA_TRAN_DONE) < 0) {
++			data->error = -EIO;
++		}
++		clear_msc_irq(host, IFLG_DATA_TRAN_DONE);
++	}
++}
++
++/*-------------------------End PIO transfer mode---------------------------*/
++
++/*
++ * Achieve mmc_request here.
++ */
++static void ingenic_mmc_data_pre(struct ingenic_mmc_host *host, struct mmc_data *data)
++{
++	unsigned int nob = data->blocks;
++	unsigned long cmdat,imsk;
++
++	msc_writel(host, RDTO, 0xffffff);
++	msc_writel(host, NOB, nob);
++	msc_writel(host, BLKLEN, data->blksz);
++	cmdat = CMDAT_DATA_EN;
++
++	msc_writel(host, CMDAT, CMDAT_DATA_EN);
++
++
++	if (data->flags & MMC_DATA_WRITE) {
++		cmdat |= CMDAT_WRITE_READ;
++		imsk = IMASK_WR_ALL_DONE | IMASK_CRC_WRITE_ERR;
++	} else if (data->flags & MMC_DATA_READ) {
++		cmdat &= ~CMDAT_WRITE_READ;
++		imsk = IMASK_DMA_DATA_DONE
++			| IMASK_TIME_OUT_READ
++			| IMASK_CRC_READ_ERR;
++	} else {
++		dev_err(host->dev, "data direction confused\n");
++		BUG_ON(1);
++	}
++	host->cmdat |= cmdat;
++
++	if (!is_pio_mode(host)) {
++		ingenic_mmc_submit_dma(host, data);
++		clear_msc_irq(host, IFLG_PRG_DONE);
++		enable_msc_irq(host, imsk);
++	}
++}
++
++static void ingenic_mmc_data_start(struct ingenic_mmc_host *host, struct mmc_data *data)
++{
++	if (is_pio_mode(host)) {
++		pio_trans_start(host, data);
++		pio_trans_done(host, data);
++		del_timer_sync(&host->request_timer);
++		disable_pio_mode(host);
++		mmc_request_done(host->mmc, host->mrq);
++	} else {
++		ingenic_mmc_dma_start(host, data);
++	}
++}
++
++static void ingenic_mmc_command_start(struct ingenic_mmc_host *host, struct mmc_command *cmd)
++{
++	unsigned long cmdat = 0;
++	unsigned long imsk;
++
++	if (cmd->flags & MMC_RSP_BUSY)
++		cmdat |= CMDAT_BUSY;
++	if (request_need_stop(host->mrq))
++		cmdat |= CMDAT_AUTO_CMD12;
++
++
++	switch (mmc_resp_type(cmd)) {
++#define _CASE(S,D) case MMC_RSP_##S: cmdat |= CMDAT_RESPONSE_##D; break
++		_CASE(R1, R1); 	/* r1 = r5,r6,r7 */
++		_CASE(R1B, R1);
++		_CASE(R2, R2);
++		_CASE(R3, R3); 	/* r3 = r4 */
++	default:
++		break;
++#undef _CASE
++	}
++	host->cmdat |= cmdat;
++	if (!is_pio_mode(host)) {
++		imsk = IMASK_TIME_OUT_RES | IMASK_END_CMD_RES;
++		enable_msc_irq(host, imsk);
++		host->state = STATE_WAITING_RESP;
++	}
++	msc_writel(host, CMD, cmd->opcode);
++	msc_writel(host, ARG, cmd->arg);
++	msc_writel(host, CMDAT, host->cmdat);
++	msc_writel(host, CTRL, CTRL_START_OP);
++	if (is_pio_mode(host)) {
++		if (wait_cmd_response(host) < 0) {
++			cmd->error = -ETIMEDOUT;
++			del_timer_sync(&host->request_timer);
++			mmc_request_done(host->mmc, host->mrq);
++			return;
++		}
++		ingenic_mmc_command_done(host, host->cmd);
++		if (!host->data) {
++			del_timer_sync(&host->request_timer);
++			mmc_request_done(host->mmc, host->mrq);
++		}
++	}
++}
++
++static void ingenic_mmc_request(struct mmc_host *mmc, struct mmc_request *mrq)
++{
++	struct ingenic_mmc_host *host = mmc_priv(mmc);
++
++	/*
++	 * It means that this request may flush cache in interrupt context.
++	 * It never happens in design, but we add BUG_ON here to prevent it.
++	 */
++	if ((host->state != STATE_IDLE) && (mrq->data != NULL)) {
++		dev_warn(host->dev, "operate in non-idle state\n");
++		WARN_ON(1);
++	}
++
++	host->mrq = mrq;
++	host->data = mrq->data;
++	host->cmd = mrq->cmd;
++	if (host->data)
++		dev_dbg(host->dev, "op:%d arg:0x%08X sz:%uk\n",
++				host->cmd->opcode, host->cmd->arg,
++				host->data->blocks >> 1);
++	else
++		dev_dbg(host->dev, "op:%d\n", host->cmd->opcode);
++
++	host->cmdat = host->cmdat_def;
++	if(host->data) {
++		if ((host->data->sg_len == 1)
++		    && (sg_dma_len(host->data->sg)) < PIO_THRESHOLD) {
++			enable_pio_mode(host);
++		}
++
++		ingenic_mmc_data_pre(host, host->data);
++	}
++	/*
++	 * We would get mmc_request_done at last, unless some terrible error
++	 * occurs such as intensity rebounding of VDD, that maybe result in
++	 * no action to complete the request.
++	 */
++	host->timeout_cnt = 0;
++	mod_timer(&host->request_timer, jiffies +
++			  msecs_to_jiffies(TIMEOUT_PERIOD));
++	ingenic_mmc_command_start(host, host->cmd);
++	if (host->data) {
++		ingenic_mmc_data_start(host, host->data);
++
++	}
++	if (unlikely(test_and_clear_bit(INGENIC_MMC_CARD_NEED_INIT, &host->flags)))
++		host->cmdat_def &= ~CMDAT_INIT;
++}
++
++static void ingenic_mmc_request_timeout(struct timer_list *t)
++{
++	struct ingenic_mmc_host *host = from_timer(host, t, request_timer);
++	unsigned int status = msc_readl(host, STAT);
++	if (host->timeout_cnt++ < (3000 / TIMEOUT_PERIOD)) {
++		dev_warn(host->dev, "timeout %dms op:%d %s sz:%d state:%d "
++				 "STAT:0x%08X DMALEN:0x%08X blks:%d/%d clk:%s\n",
++				 host->timeout_cnt * TIMEOUT_PERIOD,
++				 host->cmd->opcode,
++				 host->data
++				 ? (host->data->flags & MMC_DATA_WRITE ? "w" : "r")
++				 : "",
++				 host->data ? host->data->blocks << 9 : 0,
++				 host->state,
++				 status,
++				 msc_readl(host, DMALEN),
++				 msc_readl(host, SNOB),
++				 msc_readl(host, NOB),
++				 __clk_is_enabled(host->clk) ? "enable" : "disable");
++		mod_timer(&host->request_timer, jiffies +
++				  msecs_to_jiffies(TIMEOUT_PERIOD));
++		return;
++
++	} else if (host->timeout_cnt++ < (60000 / TIMEOUT_PERIOD)) {
++		mod_timer(&host->request_timer, jiffies +
++				  msecs_to_jiffies(TIMEOUT_PERIOD));
++		return;
++	}
++
++	dev_err(host->dev, "request time out, op=%d arg=0x%08X, "
++			"sz:%dB state=%d, status=0x%08X, pending=0x%08X, nr_desc=%d\n",
++			host->cmd->opcode, host->cmd->arg,
++			host->data ? host->data->blocks << 9 : -1,
++			host->state, status, (u32)host->pending_events,
++			host->data ? host->data->sg_len : 0);
++	ingenic_mmc_dump_reg(host);
++
++#ifdef CONFIG_MMC_INGENIC_DEBUG
++	if (host->data) {
++		int i;
++		dev_err(host->dev, "Descriptor dump:\n");
++		for (i = 0; i < MAX_DMA_DESCS; i++) {
++			unsigned int *desc = (unsigned int *)&host->dma_descs[i];
++			dev_err(host->dev, "\t%03d\t nda=%08X da=%08X len=%08X dcmd=%08X\n",
++					i, *desc, *(desc+1), *(desc+2), *(desc+3));
++		}
++		dev_err(host->dev, "\n");
++	}
++#endif
++
++	if (host->mrq) {
++		if (request_need_stop(host->mrq)) {
++			send_stop_command(host);
++		}
++		host->cmd->error = -ENOMEDIUM;
++		host->state = STATE_IDLE;
++		mmc_request_done(host->mmc, host->mrq);
++	}
++}
++
++/*---------------------------End mmc_request-------------------------------*/
++
++/*
++ * Other mmc_ops except request.
++ */
++
++static void ingenic_mmc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
++{
++	struct ingenic_mmc_host *host = mmc_priv(mmc);
++
++	switch (ios->bus_width) {
++	case MMC_BUS_WIDTH_1:
++		host->cmdat_def &= ~CMDAT_BUS_WIDTH_MASK;
++		host->cmdat_def |= CMDAT_BUS_WIDTH_1BIT;
++		break;
++	case MMC_BUS_WIDTH_4:
++		host->cmdat_def &= ~CMDAT_BUS_WIDTH_MASK;
++		host->cmdat_def |= CMDAT_BUS_WIDTH_4BIT;
++		break;
++	case MMC_BUS_WIDTH_8:
++		host->cmdat_def &= ~CMDAT_BUS_WIDTH_MASK;
++		host->cmdat_def |= CMDAT_BUS_WIDTH_8BIT;
++		break;
++	}
++
++	if (ios->clock) {
++		unsigned int clk_set = 0, clkrt = 0;
++		unsigned int clk_want = ios->clock;
++		unsigned int lpm = 0;
++
++		clk_set_rate(host->clk, ios->clock);
++
++		clk_set = clk_get_rate(host->clk);
++
++		while (clk_want < clk_set) {
++			clkrt++;
++			clk_set >>= 1;
++		}
++
++		/* discard this warning on board 4785 fpga */
++		if ((clk_want > 3000000) && clkrt) {
++			dev_err(host->dev, "CLKRT must be set to 0 "
++					"when MSC works during normal r/w: "
++					"ios->clock=%d clk_want=%d "
++					"clk_set=%d clkrt=%X,\n",
++					ios->clock, clk_want, clk_set, clkrt);
++			WARN_ON(1);
++		}
++
++		if (clkrt > 7) {
++			dev_err(host->dev, "invalid value of CLKRT: "
++					"ios->clock=%d clk_want=%d "
++					"clk_set=%d clkrt=%X,\n",
++					ios->clock, clk_want, clk_set, clkrt);
++			WARN_ON(1);
++			return;
++		}
++		if (!clkrt)
++			dev_dbg(host->dev, "clk_want: %u, clk_set: %luHz\n",
++					 ios->clock, clk_get_rate(host->clk));
++
++		msc_writel(host, CLKRT, clkrt);
++
++		/* sample immediately at clk rising edge */
++		if (clk_set > 25000000)
++			lpm = (0x2 << LPM_DRV_SEL_SHF);
++
++		if (host->flags & INGENIC_MMC_IS_SDIO) {
++			msc_writel(host, LPM, lpm);
++			msc_writel(host, CTRL, CTRL_CLOCK_START);
++		} else {
++			lpm |= LPM_LPM;
++			msc_writel(host, LPM, lpm);
++		}
++	}
++
++	switch (ios->power_mode) {
++	case MMC_POWER_UP:
++		ingenic_mmc_reset(host);
++		if (!IS_ERR(mmc->supply.vmmc))
++			mmc_regulator_set_ocr(mmc, mmc->supply.vmmc, ios->vdd);
++		host->cmdat_def |= CMDAT_INIT;
++		set_bit(INGENIC_MMC_CARD_NEED_INIT, &host->flags);
++		clk_prepare_enable(host->clk);
++		break;
++	case MMC_POWER_ON:
++		break;
++	default:
++		if (!IS_ERR(mmc->supply.vmmc))
++			mmc_regulator_set_ocr(mmc, mmc->supply.vmmc, 0);
++		clk_disable_unprepare(host->clk);
++		break;
++	}
++}
++
++static void ingenic_mmc_enable_sdio_irq(struct mmc_host *mmc, int enable)
++{
++	struct ingenic_mmc_host *host = mmc_priv(mmc);
++
++	if (enable) {
++		enable_msc_irq(host, IMASK_SDIO);
++	} else {
++		clear_msc_irq(host, IFLG_SDIO);
++		disable_msc_irq(host, IMASK_SDIO);
++	}
++}
++
++static void ingenic_mmc_init_card(struct mmc_host *mmc, struct mmc_card *card) {
++	struct ingenic_mmc_host *host = mmc_priv(mmc);
++
++#ifdef CONFIG_MMC_INGENIC_DEBUG
++	dev_info(host->dev, "card type is %d\n", card->type);
++#endif
++
++	if (card->type == MMC_TYPE_SDIO || card->type == MMC_TYPE_SD_COMBO) {
++		host->flags |= INGENIC_MMC_IS_SDIO;
++	} else {
++		host->flags &= ~INGENIC_MMC_IS_SDIO;
++	}
++}
++
++static const struct mmc_host_ops ingenic_mmc_ops = {
++	.request		= ingenic_mmc_request,
++	.set_ios		= ingenic_mmc_set_ios,
++	.get_ro			= mmc_gpio_get_ro,
++	.get_cd			= mmc_gpio_get_cd,
++	.enable_sdio_irq	= ingenic_mmc_enable_sdio_irq,
++	.init_card		= ingenic_mmc_init_card,
++};
++
++/*
++ * Platform driver and initialization.
++ */
++
++static void ingenic_mmc_dma_desc_init(struct ingenic_mmc_host *host)
++{
++	for (unsigned i = 0; i < MAX_DMA_DESCS; i++) {
++		struct sdma_desc *sd = &host->dma_descs[i];
++		sd->nda = host->dma_descs_phys + sizeof(struct sdma_desc) * (i + 1);
++	}
++}
++
++static const struct of_device_id mmc_ingenic_of_match[] = {
++	{.compatible = "ingenic,x1000-mmc", },
++	{.compatible = "ingenic,x1600-mmc", },
++	{.compatible = "ingenic,x1800-mmc", },
++	{},
++};
++MODULE_DEVICE_TABLE(of, mmc_ingenic_of_match);
++
++static int mmc_ingenic_probe(struct platform_device *pdev)
++{
++	struct ingenic_mmc_host *host;
++	struct mmc_host *mmc;
++	struct resource *regs;
++	int ret = 0;
++
++	mmc = mmc_alloc_host(sizeof(struct ingenic_mmc_host), &pdev->dev);
++	if (!mmc)
++		return -ENOMEM;
++
++	host = mmc_priv(mmc);
++	host->dev = &pdev->dev;
++
++	ret = mmc_of_parse(mmc);
++	if (ret) {
++		dev_err_probe(&pdev->dev, ret, "could not parse device properties\n");
++		goto err_free_host;
++	}
++
++	mmc_regulator_get_supply(mmc);
++
++	host->irq = platform_get_irq(pdev, 0);
++	if (host->irq < 0) {
++		ret = host->irq;
++		goto err_free_host;
++	}
++
++	host->clk = devm_clk_get(&pdev->dev, "mmc");
++	if (IS_ERR(host->clk)) {
++		ret = PTR_ERR(host->clk);
++		dev_err(&pdev->dev, "Failed to get mmc clock\n");
++		goto err_free_host;
++	}
++
++	regs = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	host->iomem = devm_ioremap_resource(&pdev->dev, regs);
++	if (IS_ERR(host->iomem)) {
++		ret = PTR_ERR(host->iomem);
++		goto err_free_host;
++	}
++
++	mmc->ops = &ingenic_mmc_ops;
++	mmc->f_min = 200000;
++	if (!mmc->f_max)
++		mmc->f_max = 24000000;
++
++	mmc->ocr_avail = MMC_VDD_32_33 | MMC_VDD_33_34;
++
++	mmc->max_busy_timeout = TIMEOUT_PERIOD;
++
++	mmc->max_segs = MAX_DMA_DESCS;
++	mmc->max_blk_size = 512;
++	mmc->max_blk_count = 4096;
++	mmc->max_req_size = 4096 * 512;
++	mmc->max_seg_size = mmc->max_req_size;
++
++	host->mmc = mmc;
++	spin_lock_init(&host->lock);
++	timer_setup(&host->request_timer, ingenic_mmc_request_timeout, TIMER_IRQSAFE);
++
++	host->cmdat_def = CMDAT_RTRG_EQUALT_16 | CMDAT_TTRG_LESS_16 |
++						CMDAT_BUS_WIDTH_1BIT;
++
++	ret = devm_request_threaded_irq(host->dev, host->irq, NULL,
++			ingenic_mmc_thread_handle, IRQF_ONESHOT, dev_name(host->dev), host);
++
++	if (ret) {
++		dev_err(&pdev->dev, "Failed to request irq: %d\n", ret);
++		goto err_free_host;
++	}
++
++	platform_set_drvdata(pdev, host);
++	ret = mmc_add_host(mmc);
++
++	if (ret) {
++		dev_err(&pdev->dev, "Failed to add mmc host: %d\n", ret);
++		goto err_free_irq;
++	}
++
++	host->dma_descs = dmam_alloc_coherent(&pdev->dev, sizeof(struct sdma_desc) * MAX_DMA_DESCS,
++						&host->dma_descs_phys,
++						GFP_KERNEL);
++	if (!host->dma_descs) {
++		dev_err(&pdev->dev, "Failed to allocate DMA descriptors\n");
++		ret = -ENOMEM;
++		goto err_free_irq;
++	}
++
++	ingenic_mmc_dma_desc_init(host);
++
++	dev_info(&pdev->dev, "Ingenic SD/MMC card driver registered\n");
++
++	dev_info(&pdev->dev, "Using %s, %d-bit mode\n",
++		 test_bit(INGENIC_MMC_USE_PIO, &host->flags) ? "PIO" : "DMA",
++		 (mmc->caps & MMC_CAP_8_BIT_DATA) ? 8 :
++		 ((mmc->caps & MMC_CAP_4_BIT_DATA) ? 4 : 1));
++
++	return 0;
++
++err_free_irq:
++	free_irq(host->irq, host);
++err_free_host:
++	mmc_free_host(mmc);
++	clk_disable_unprepare(host->clk);
++
++	return ret;
++}
++
++static int __exit mmc_ingenic_remove(struct platform_device *pdev)
++{
++	struct ingenic_mmc_host *host = platform_get_drvdata(pdev);
++
++	mmc_remove_host(host->mmc);
++	mmc_free_host(host->mmc);
++
++	free_irq(host->irq, host);
++
++	dmam_free_coherent(&pdev->dev, sizeof(struct sdma_desc) * MAX_DMA_DESCS, host->dma_descs, host->dma_descs_phys);
++
++	clk_put(host->clk);
++	iounmap(host->iomem);
++	kfree(host);
++
++	return 0;
++}
++
++static int mmc_ingenic_suspend(struct device *dev)
++{
++	return pinctrl_pm_select_sleep_state(dev);
++}
++
++static int mmc_ingenic_resume(struct device *dev)
++{
++	return pinctrl_select_default_state(dev);
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(mmc_ingenic_pm_ops, mmc_ingenic_suspend,
++						 mmc_ingenic_resume);
++
++static struct platform_driver mmc_ingenic_driver = {
++	.driver	= {
++		.name = "ingenic-mmc",
++		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
++		.owner = THIS_MODULE,
++		.pm = &mmc_ingenic_pm_ops,
++		.of_match_table = of_match_ptr(mmc_ingenic_of_match),
++	},
++	.probe = mmc_ingenic_probe,
++	.remove = mmc_ingenic_remove,
++};
++
++module_platform_driver(mmc_ingenic_driver);
++
++MODULE_DESCRIPTION("Ingenic X series Multimedia Card Interface driver");
++MODULE_AUTHOR("Large Dipper <ykli@ingenic.com>");
++MODULE_AUTHOR("bo.liu <bo.liu@ingenic.cn>");
++MODULE_AUTHOR("qipengzhen <aric.pzqi@ingenic.com>");
++MODULE_AUTHOR("Reimu NotMoe <reimu@sudomaker.com>");
++MODULE_LICENSE("GPL v2");
++MODULE_VERSION("20230524");
+
+diff --git a/drivers/mmc/host/sdhci-ingenic.c b/drivers/mmc/host/sdhci-ingenic.c
+new file mode 100644
+index 000000000000..e798128b10c5
+--- /dev/null
++++ b/drivers/mmc/host/sdhci-ingenic.c
+@@ -0,0 +1,284 @@
++#include <linux/module.h>
++#include <linux/of_address.h>
++#include <linux/pm.h>
++#include <linux/pm_runtime.h>
++
++#include "sdhci-pltfm.h"
++
++/* Software redefinition caps */
++#define CAPABILITIES1_SW	0x276dc898
++#define CAPABILITIES2_SW	0
++
++#define CPM_MSC0_CLK_R		(0xB0000068)
++#define CPM_MSC1_CLK_R		(0xB00000a4)
++#define CPM_MSC2_CLK_R		(0xB00000a8)
++
++struct sdhci_ingenic_pdata {
++	unsigned int    host_caps;
++	unsigned int    host_caps2;
++	unsigned int    pm_caps;
++
++	unsigned int	pio_mode;
++	unsigned int	enable_autocmd12;
++};
++
++struct sdhci_ingenic {
++	struct device			*dev;
++	struct sdhci_host		*host;
++	struct platform_device		*pdev;
++	struct sdhci_ingenic_pdata	*pdata;
++	struct clk			*clk_cgu;
++	struct clk			*clk_ext;
++	struct clk			*parent;
++};
++
++static unsigned int sdhci_ingenic_get_cpm_msc(struct sdhci_host *host)
++{
++	char msc_ioaddr[16];
++	unsigned int cpm_msc;
++	sprintf(msc_ioaddr, "0x%x", (unsigned int)host->ioaddr);
++
++	if (!strcmp(msc_ioaddr ,"0xb3450000"))
++		cpm_msc = CPM_MSC0_CLK_R;
++	if (!strcmp(msc_ioaddr ,"0xb3460000"))
++		cpm_msc = CPM_MSC1_CLK_R;
++	if (!strcmp(msc_ioaddr ,"0xb3490000"))
++		cpm_msc = CPM_MSC2_CLK_R;
++
++	return cpm_msc;
++}
++
++/**
++ * sdhci_ingenic_msc_tuning  Enable msc controller tuning
++ *
++ * Tuning rx phase
++ * */
++static void sdhci_ingenic_en_msc_tuning(struct sdhci_host *host, unsigned int cpm_msc)
++{
++	if (host->mmc->ios.timing & MMC_TIMING_UHS_SDR50 ||
++		host->mmc->ios.timing & MMC_TIMING_UHS_SDR104 ||
++		host->mmc->ios.timing & MMC_TIMING_MMC_HS400)
++		*(volatile unsigned int*)cpm_msc &= ~(0x1 << 20);
++}
++
++/**
++ * sdhci_ingenic_set_clock - callback on clock change
++ * @host: The SDHCI host being changed
++ * @clock: The clock rate being requested.
++ *
++ * When the card's clock is going to be changed, look at the new frequency
++ * and find the best clock source to go with it.
++*/
++static void sdhci_ingenic_set_clock(struct sdhci_host *host, unsigned int clock)
++{
++	struct sdhci_ingenic *sdhci_ing = sdhci_priv(host);
++	unsigned int cpm_msc = sdhci_ingenic_get_cpm_msc(host);
++
++	if (clock == 0)
++		return;
++
++	sdhci_set_clock(host, clock);
++
++	if (clock > 400000) {
++		clk_disable_unprepare(sdhci_ing->clk_cgu);
++		clk_set_parent(sdhci_ing->clk_cgu, sdhci_ing->parent);
++		clk_prepare_enable(sdhci_ing->clk_cgu);
++	} else {
++		clk_disable_unprepare(sdhci_ing->clk_cgu);
++		clk_set_parent(sdhci_ing->clk_cgu, sdhci_ing->clk_ext);
++		clk_prepare_enable(sdhci_ing->clk_cgu);
++	}
++
++	clk_set_rate(sdhci_ing->clk_cgu, clock);
++
++	printk("%s, set clk: %d, get_clk_rate=%ld\n", __func__, clock, clk_get_rate(sdhci_ing->clk_cgu));
++
++	if (host->mmc->ios.timing == MMC_TIMING_MMC_HS200 ||
++		host->mmc->ios.timing == MMC_TIMING_UHS_SDR104)
++		sdhci_ingenic_en_msc_tuning(host, cpm_msc);
++}
++
++static struct sdhci_ops sdhci_ingenic_ops = {
++	.set_clock = sdhci_ingenic_set_clock,
++	.set_bus_width = sdhci_set_bus_width,
++	.reset = sdhci_reset,
++	.set_uhs_signaling = sdhci_set_uhs_signaling,
++};
++
++static int sdhci_ingenic_probe(struct platform_device *pdev)
++{
++	struct sdhci_ingenic_pdata *pdata;
++	struct device *dev = &pdev->dev;
++	struct sdhci_host *host;
++	struct sdhci_ingenic *sdhci_ing;
++	const u32 caps = CAPABILITIES1_SW;
++	const u32 caps1 = CAPABILITIES2_SW;
++	int ret, irq;
++
++	if (!pdev->dev.of_node) {
++		dev_err(dev, "no device data specified\n");
++		return -ENOENT;
++	}
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0) {
++		dev_err(dev, "no irq specified\n");
++		return irq;
++	}
++
++	host = sdhci_alloc_host(dev, sizeof(struct sdhci_ingenic));
++	if (IS_ERR(host)) {
++		dev_err(dev, "sdhci_alloc_host() failed\n");
++		return PTR_ERR(host);
++	}
++
++	sdhci_ing = sdhci_priv(host);
++
++	pdata = devm_kzalloc(&pdev->dev, sizeof(*pdata), GFP_KERNEL);
++	if (!pdata) {
++		ret = -ENOMEM;
++		return ret;
++	}
++
++	sdhci_ing->clk_cgu = devm_clk_get(&pdev->dev, "sdhci");
++	if(!sdhci_ing->clk_cgu) {
++		dev_err(&pdev->dev, "Failed to Get MSC clk!\n");
++		return PTR_ERR(sdhci_ing->clk_cgu);
++	}
++
++	sdhci_ing->clk_ext = devm_clk_get(&pdev->dev, "ext");
++
++	sdhci_ing->parent = clk_get_parent(sdhci_ing->clk_cgu);
++
++	clk_prepare_enable(sdhci_ing->clk_cgu);
++
++	sdhci_ing->host = host;
++	sdhci_ing->dev  = &pdev->dev;
++	sdhci_ing->pdev = pdev;
++	sdhci_ing->pdata = pdata;
++
++	host->ioaddr= of_iomap(pdev->dev.of_node, 0);
++	if (IS_ERR(host->ioaddr))
++		return PTR_ERR(host->ioaddr);
++
++	platform_set_drvdata(pdev, host);
++	host->hw_name = "ingenic-sdhci";
++	host->ops = &sdhci_ingenic_ops;
++	host->quirks = 0;
++	host->irq = irq;
++
++	/* Software redefinition caps */
++	__sdhci_read_caps(host, NULL, &caps, &caps1);
++
++	/* not check wp */
++	host->quirks |= SDHCI_QUIRK_INVERTED_WRITE_PROTECT;
++
++	/* Setup quirks for the controller */
++	host->quirks |= SDHCI_QUIRK_NO_ENDATTR_IN_NOPDESC;
++	host->quirks |= SDHCI_QUIRK_NO_HISPD_BIT;
++
++	/* Data Timeout Counter Value */
++	host->quirks |= SDHCI_QUIRK_BROKEN_TIMEOUT_VAL;
++
++	/* This host supports the Auto CMD12 */
++	host->quirks |= SDHCI_QUIRK_MULTIBLOCK_READ_ACMD12;
++
++	host->quirks |= SDHCI_QUIRK_32BIT_DMA_ADDR | SDHCI_QUIRK_32BIT_DMA_SIZE;
++
++	ret = mmc_of_parse(host->mmc);
++	if (ret) {
++		dev_err(dev, "mmc_of_parse() failed\n");
++		return ret;
++	}
++
++	sdhci_get_of_property(pdev);
++
++	sdhci_enable_v4_mode(host);
++	ret = sdhci_add_host(host);
++	if (ret) {
++		dev_err(dev, "sdhci_add_host() failed\n");
++		goto err_clk;
++	}
++
++	return 0;
++err_clk:
++	clk_disable_unprepare(sdhci_ing->clk_cgu);
++	sdhci_pltfm_free(pdev);
++	return ret;
++}
++
++static int sdhci_ingenic_remove(struct platform_device *pdev)
++{
++	struct sdhci_host *host =  platform_get_drvdata(pdev);
++	struct sdhci_ingenic *sdhci_ing = sdhci_priv(host);
++
++	sdhci_remove_host(host, 1);
++
++	pm_runtime_dont_use_autosuspend(&pdev->dev);
++	pm_runtime_disable(&pdev->dev);
++
++	clk_disable_unprepare(sdhci_ing->clk_cgu);
++
++	sdhci_free_host(host);
++	platform_set_drvdata(pdev, NULL);
++
++	return 0;
++}
++
++#ifdef CONFIG_PM_SLEEP
++static int sdhci_ingenic_suspend(struct device *dev)
++{
++	struct sdhci_host *host = dev_get_drvdata(dev);
++	struct sdhci_ingenic *sdhci_ing = sdhci_priv(host) ;
++
++	sdhci_suspend_host(host);
++
++	clk_disable_unprepare(sdhci_ing->clk_cgu);
++
++	pinctrl_pm_select_sleep_state(dev);
++
++	return 0;
++}
++
++static int sdhci_ingenic_resume(struct device *dev)
++{
++	struct sdhci_host *host = dev_get_drvdata(dev);
++	struct sdhci_ingenic *sdhci_ing = sdhci_priv(host);
++
++	pinctrl_select_default_state(dev);
++
++	clk_prepare_enable(sdhci_ing->clk_cgu);
++
++	sdhci_resume_host(host);
++
++	return 0;
++}
++#endif
++
++static SIMPLE_DEV_PM_OPS(sdhci_ingenic_pmops, sdhci_ingenic_suspend,
++	sdhci_ingenic_resume);
++
++static const struct of_device_id sdhci_ingenic_dt_matches[] = {
++	{.compatible = "ingenic,x2000-sdhci", },
++	{.compatible = "ingenic,x2500-sdhci", },
++	{},
++};
++MODULE_DEVICE_TABLE(of, sdhci_ingenic_dt_matches);
++
++static struct platform_driver sdhci_ingenic_driver = {
++	.probe		= sdhci_ingenic_probe,
++	.remove		= sdhci_ingenic_remove,
++	.driver		= {
++		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
++		.name	= "ingenic,sdhci",
++		.pm	= &sdhci_ingenic_pmops,
++		.of_match_table = of_match_ptr(sdhci_ingenic_dt_matches),
++	},
++};
++
++module_platform_driver(sdhci_ingenic_driver);
++
++MODULE_DESCRIPTION("Ingenic SDHCI (MSC) driver");
++MODULE_AUTHOR("Large Dipper <wangquan.shao@ingenic.cn>");
++MODULE_LICENSE("GPL v2");
++MODULE_VERSION("20160808");
+
+diff --git a/drivers/mtd/Kconfig b/drivers/mtd/Kconfig
+index 796a2eccbef0..e9b844c9e994 100644
+--- a/drivers/mtd/Kconfig
++++ b/drivers/mtd/Kconfig
+@@ -57,6 +57,18 @@ config MTD_BLOCK
+ 	  You do not need this option for use with the DiskOnChip devices. For
+ 	  those, enable NFTL support (CONFIG_NFTL) instead.
+ 
++if MTD_BLOCK
++
++config MTD_BLOCK_USE_4K_BLKSIZE
++	bool "Use 4K block size"
++	default n
++	help
++	  Use 4KiB block size instead of the default 512 bytes.
++
++	  It may improve performance in some use cases.
++
++endif
++
+ config MTD_BLOCK_RO
+ 	tristate "Readonly block device access to MTD devices"
+ 	depends on MTD_BLOCK!=y && BLOCK
+
+diff --git a/drivers/mtd/devices/Kconfig b/drivers/mtd/devices/Kconfig
+index ff2f9e55ef28..6dc655f3e5ef 100644
+--- a/drivers/mtd/devices/Kconfig
++++ b/drivers/mtd/devices/Kconfig
+@@ -95,6 +95,12 @@ config MTD_MCHP48L640
+ 	help
+ 	  This enables access to Microchip 48L640 EERAM chips, using SPI.
+ 
++config MTD_LYONTEK_LY68
++	tristate "Lyontek LY68 series PSRAM"
++	depends on SPI_MASTER
++	help
++	  This enables access to Lyontek LY68 series PSRAM chips, using SPI.
++
+ config MTD_SPEAR_SMI
+ 	tristate "SPEAR MTD NOR Support through SMI controller"
+ 	depends on PLAT_SPEAR || COMPILE_TEST
+
+diff --git a/drivers/mtd/devices/Makefile b/drivers/mtd/devices/Makefile
+index d11eb2b8b6f8..d1f192262568 100644
+--- a/drivers/mtd/devices/Makefile
++++ b/drivers/mtd/devices/Makefile
+@@ -13,6 +13,7 @@ obj-$(CONFIG_MTD_BLOCK2MTD)	+= block2mtd.o
+ obj-$(CONFIG_MTD_DATAFLASH)	+= mtd_dataflash.o
+ obj-$(CONFIG_MTD_MCHP23K256)	+= mchp23k256.o
+ obj-$(CONFIG_MTD_MCHP48L640)	+= mchp48l640.o
++obj-$(CONFIG_MTD_LYONTEK_LY68)	+= ly68.o
+ obj-$(CONFIG_MTD_SPEAR_SMI)	+= spear_smi.o
+ obj-$(CONFIG_MTD_SST25L)	+= sst25l.o
+ obj-$(CONFIG_MTD_BCM47XXSFLASH)	+= bcm47xxsflash.o
+
+diff --git a/drivers/mtd/devices/ly68.c b/drivers/mtd/devices/ly68.c
+new file mode 100644
+index 000000000000..d04fe19e807e
+--- /dev/null
++++ b/drivers/mtd/devices/ly68.c
+@@ -0,0 +1,288 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Driver for Lyontek LY68 series PSRAM chips
++ *
++ * Copyright (C) 2023 Reimu NotMoe <reimu@sudomaker.com>
++ */
++
++#include <linux/device.h>
++#include <linux/module.h>
++#include <linux/mtd/mtd.h>
++#include <linux/mtd/partitions.h>
++#include <linux/ktime.h>
++#include <linux/delay.h>
++#include <linux/mutex.h>
++#include <linux/sched.h>
++#include <linux/sizes.h>
++#include <linux/spi/flash.h>
++#include <linux/spi/spi.h>
++#include <linux/of_device.h>
++
++struct ly68_caps {
++	unsigned int size;
++};
++
++struct ly68_flash {
++	struct spi_device	*spi;
++	struct mutex		lock;
++	struct mtd_info		mtd;
++	unsigned		op_sleep_ratio;
++	unsigned		tx_speed_hz, rx_speed_hz;
++	u64			ts_last_op, ts_sleep_till;
++	const struct ly68_caps	*caps;
++};
++
++#define LY68_PAGE_SIZE			SZ_1K
++#define LY68_CMD_WRITE			0x02
++#define LY68_CMD_READ			0x0b
++#define LY68_WHOLE_CHIP_REFRESH_TIME	65000000
++
++#define to_ly68_flash(x) container_of(x, struct ly68_flash, mtd)
++
++static inline void ly68_dynamic_sleep(u32 nsecs)
++{
++	if (nsecs > LY68_WHOLE_CHIP_REFRESH_TIME)
++		nsecs = LY68_WHOLE_CHIP_REFRESH_TIME;
++
++	if (nsecs < 10 * 1000)
++		ndelay(nsecs);
++	else
++		usleep_range(nsecs / 1000, nsecs / 1000);
++}
++
++static inline u32 ly68_cmd_word(u32 addr, u32 cmd)
++{
++	addr &= 0x00ffffff;
++	return (cmd << 24) | addr;
++}
++
++static int ly68_write(struct mtd_info *mtd, loff_t to, size_t len,
++			    size_t *retlen, const unsigned char *buf)
++{
++	struct ly68_flash *flash = to_ly68_flash(mtd);
++	struct spi_transfer transfer[2] = {};
++	struct spi_message message;
++	u32 command_32b[1];
++	u64 ts_op_start, ts_op_end, ts_cur;
++	u32 t_op, t_sleep;
++	int ret, cmd_len;
++
++	spi_message_init(&message);
++
++	command_32b[0] = ly68_cmd_word(to, LY68_CMD_WRITE);
++
++	transfer[0].tx_buf = command_32b;
++	transfer[0].len = sizeof(command_32b);
++	transfer[0].bits_per_word = 32;
++	spi_message_add_tail(&transfer[0], &message);
++
++	transfer[1].tx_buf = buf;
++	transfer[1].len = len;
++	transfer[1].bits_per_word = 32;
++	spi_message_add_tail(&transfer[1], &message);
++
++	if (flash->tx_speed_hz) {
++		transfer[0].speed_hz = flash->tx_speed_hz;
++		transfer[1].speed_hz = flash->tx_speed_hz;
++	}
++
++	mutex_lock(&flash->lock);
++
++	ts_cur = ktime_get_ns();
++
++	if (ts_cur < flash->ts_sleep_till) {
++		ly68_dynamic_sleep((u32)(flash->ts_sleep_till - ts_cur));
++		ts_op_start = ktime_get_ns();
++	} else {
++		ts_op_start = ts_cur;
++	}
++
++	ret = spi_sync(flash->spi, &message);
++
++	ts_op_end = ktime_get_ns();
++
++	t_op = (u32)(ts_op_end - ts_op_start);
++	t_sleep = t_op / flash->op_sleep_ratio + ((t_op % flash->op_sleep_ratio) ? 1 : 0);
++
++	flash->ts_sleep_till = ts_op_end + t_sleep;
++
++	mutex_unlock(&flash->lock);
++
++	if (ret)
++		return ret;
++
++	if (retlen && message.actual_length > cmd_len)
++		*retlen += message.actual_length - cmd_len;
++
++	return 0;
++}
++
++static int ly68_read(struct mtd_info *mtd, loff_t from, size_t len,
++			   size_t *retlen, unsigned char *buf)
++{
++	struct ly68_flash *flash = to_ly68_flash(mtd);
++	struct spi_transfer transfer[2] = {};
++	struct spi_message message;
++	u32 command_32b[2];
++	u64 ts_op_start, ts_op_end, ts_cur;
++	u32 t_op, t_sleep;
++	int ret, cmd_len;
++
++	spi_message_init(&message);
++
++	command_32b[0] = ly68_cmd_word(from - 3, LY68_CMD_READ);
++
++	transfer[0].tx_buf = command_32b;
++	transfer[0].len = sizeof(command_32b);
++	transfer[0].bits_per_word = 32;
++	spi_message_add_tail(&transfer[0], &message);
++
++	transfer[1].rx_buf = buf;
++	transfer[1].len = len;
++	transfer[1].bits_per_word = 32;
++	spi_message_add_tail(&transfer[1], &message);
++
++	if (flash->rx_speed_hz) {
++		transfer[0].speed_hz = flash->rx_speed_hz;
++		transfer[1].speed_hz = flash->rx_speed_hz;
++	}
++
++	mutex_lock(&flash->lock);
++
++	ts_cur = ktime_get_ns();
++
++	if (ts_cur < flash->ts_sleep_till) {
++		ly68_dynamic_sleep((u32)(flash->ts_sleep_till - ts_cur));
++		ts_op_start = ktime_get_ns();
++	} else {
++		ts_op_start = ts_cur;
++	}
++
++	ret = spi_sync(flash->spi, &message);
++
++	ts_op_end = ktime_get_ns();
++
++	t_op = (u32)(ts_op_end - ts_op_start);
++	t_sleep = t_op / flash->op_sleep_ratio + ((t_op % flash->op_sleep_ratio) ? 1 : 0);
++
++	flash->ts_sleep_till = ts_op_end + t_sleep;
++
++	mutex_unlock(&flash->lock);
++
++	if (ret)
++		return ret;
++
++	if (retlen && message.actual_length > cmd_len)
++		*retlen += len;
++
++	return 0;
++}
++
++static const struct ly68_caps ly68l6400_caps = {
++	.size = SZ_8M,
++};
++
++static const struct ly68_caps ly68l3200_caps = {
++	.size = SZ_4M,
++};
++
++static int ly68_probe(struct spi_device *spi)
++{
++	struct ly68_flash *flash;
++	struct flash_platform_data *data;
++	int err;
++
++	flash = devm_kzalloc(&spi->dev, sizeof(*flash), GFP_KERNEL);
++	if (!flash)
++		return -ENOMEM;
++
++	flash->spi = spi;
++	mutex_init(&flash->lock);
++	spi_set_drvdata(spi, flash);
++
++	data = dev_get_platdata(&spi->dev);
++
++	flash->caps = of_device_get_match_data(&spi->dev);
++	if (!flash->caps)
++		flash->caps = &ly68l6400_caps;
++
++	mtd_set_of_node(&flash->mtd, spi->dev.of_node);
++	flash->mtd.dev.parent	= &spi->dev;
++	flash->mtd.type		= MTD_RAM;
++	flash->mtd.flags	= MTD_CAP_RAM;
++	flash->mtd.erasesize	= 4;
++	flash->mtd.writesize	= 4;
++	flash->mtd.size		= flash->caps->size;
++	flash->mtd._read	= ly68_read;
++	flash->mtd._write	= ly68_write;
++
++	flash->op_sleep_ratio = 8;
++	device_property_read_u32(&spi->dev, "lyontek,op-sleep-ratio", &flash->op_sleep_ratio);
++	device_property_read_u32(&spi->dev, "lyontek,tx-max-frequency", &flash->tx_speed_hz);
++	device_property_read_u32(&spi->dev, "lyontek,rx-max-frequency", &flash->rx_speed_hz);
++
++	// If you remove this line of code below, you will be violating the GPL license directly.
++	// We won't be doing nothing if that's the case. Think twice.
++	// 如果你删除下面这行代码，你将会直接违反 GPL 许可。
++	// 我们面对侵权不会无动于衷，国内已有相关判例。请三思。
++	dev_info(&spi->dev, "Lyontek LY68 series PSRAM support by SudoMaker (https://su.mk)\n");
++
++	err = mtd_device_register(&flash->mtd, data ? data->parts : NULL,
++				  data ? data->nr_parts : 0);
++	if (err)
++		return err;
++
++	flash->ts_last_op = ktime_get_ns();
++
++	return 0;
++}
++
++static void ly68_remove(struct spi_device *spi)
++{
++	struct ly68_flash *flash = spi_get_drvdata(spi);
++
++	WARN_ON(mtd_device_unregister(&flash->mtd));
++}
++
++static const struct of_device_id ly68_of_table[] = {
++	{
++		.compatible = "lyontek,ly68l6400",
++		.data = &ly68l6400_caps,
++	},
++	{
++		.compatible = "lyontek,ly68l3200",
++		.data = &ly68l3200_caps,
++	},
++	{}
++};
++MODULE_DEVICE_TABLE(of, ly68_of_table);
++
++static const struct spi_device_id ly68_spi_ids[] = {
++	{
++		.name = "lyontek_ly68l6400",
++		.driver_data = (kernel_ulong_t)&ly68l6400_caps,
++	},
++	{
++		.name = "lyontek_ly68l3200",
++		.driver_data = (kernel_ulong_t)&ly68l3200_caps,
++	},
++	{}
++};
++MODULE_DEVICE_TABLE(spi, ly68_spi_ids);
++
++static struct spi_driver ly68_driver = {
++	.driver = {
++		.name	= "lyontek_ly68",
++		.of_match_table = ly68_of_table,
++	},
++	.probe		= ly68_probe,
++	.remove		= ly68_remove,
++	.id_table	= ly68_spi_ids,
++};
++
++module_spi_driver(ly68_driver);
++
++MODULE_DESCRIPTION("MTD SPI driver for Lyontek LY68 series PSRAM chips");
++MODULE_AUTHOR("Reimu NotMoe <reimu@sudomaker.com>");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("spi:lyontek_ly68");
+
+diff --git a/drivers/mtd/mtdblock.c b/drivers/mtd/mtdblock.c
+index 9751416c2a91..486c00bf62c6 100644
+--- a/drivers/mtd/mtdblock.c
++++ b/drivers/mtd/mtdblock.c
+@@ -20,6 +20,11 @@
+ #include <linux/mutex.h>
+ #include <linux/major.h>
+ 
++#ifdef CONFIG_MTD_BLOCK_USE_4K_BLKSIZE
++#define MTDBLOCK_IOSIZE		4096
++#else
++#define MTDBLOCK_IOSIZE		512
++#endif
+ 
+ struct mtdblk_dev {
+ 	struct mtd_blktrans_dev mbd;
+@@ -231,7 +236,7 @@ static int mtdblock_readsect(struct mtd_blktrans_dev *dev,
+ 			      unsigned long block, char *buf)
+ {
+ 	struct mtdblk_dev *mtdblk = container_of(dev, struct mtdblk_dev, mbd);
+-	return do_cached_read(mtdblk, block<<9, 512, buf);
++	return do_cached_read(mtdblk, block * MTDBLOCK_IOSIZE, MTDBLOCK_IOSIZE, buf);
+ }
+ 
+ static int mtdblock_writesect(struct mtd_blktrans_dev *dev,
+@@ -247,7 +252,7 @@ static int mtdblock_writesect(struct mtd_blktrans_dev *dev,
+ 		 * return -EAGAIN sometimes, but why bother?
+ 		 */
+ 	}
+-	return do_cached_write(mtdblk, block<<9, 512, buf);
++	return do_cached_write(mtdblk, block * MTDBLOCK_IOSIZE, MTDBLOCK_IOSIZE, buf);
+ }
+ 
+ static int mtdblock_open(struct mtd_blktrans_dev *mbd)
+@@ -324,7 +329,7 @@ static void mtdblock_add_mtd(struct mtd_blktrans_ops *tr, struct mtd_info *mtd)
+ 	dev->mbd.mtd = mtd;
+ 	dev->mbd.devnum = mtd->index;
+ 
+-	dev->mbd.size = mtd->size >> 9;
++	dev->mbd.size = mtd->size / MTDBLOCK_IOSIZE;
+ 	dev->mbd.tr = tr;
+ 
+ 	if (!(mtd->flags & MTD_WRITEABLE))
+@@ -343,7 +348,7 @@ static struct mtd_blktrans_ops mtdblock_tr = {
+ 	.name		= "mtdblock",
+ 	.major		= MTD_BLOCK_MAJOR,
+ 	.part_bits	= 0,
+-	.blksize 	= 512,
++	.blksize 	= MTDBLOCK_IOSIZE,
+ 	.open		= mtdblock_open,
+ 	.flush		= mtdblock_flush,
+ 	.release	= mtdblock_release,
+
+diff --git a/drivers/mtd/nand/spi/winbond.c b/drivers/mtd/nand/spi/winbond.c
+index f507e3759301..ebf0b7b8df3e 100644
+--- a/drivers/mtd/nand/spi/winbond.c
++++ b/drivers/mtd/nand/spi/winbond.c
+@@ -191,13 +191,13 @@ static const struct spinand_info winbond_spinand_table[] = {
+ 		     SPINAND_ECCINFO(&w25n01kv_ooblayout, w25n02kv_ecc_get_status)),
+ 	SPINAND_INFO("W25N02KV",
+ 		     SPINAND_ID(SPINAND_READID_METHOD_OPCODE_DUMMY, 0xaa, 0x22),
+-		     NAND_MEMORG(1, 2048, 128, 64, 2048, 40, 1, 1, 1),
+-		     NAND_ECCREQ(8, 512),
++		     NAND_MEMORG(1, 2048, 64, 64, 2048, 20, 1, 1, 1),
++		     NAND_ECCREQ(1, 512),
+ 		     SPINAND_INFO_OP_VARIANTS(&read_cache_variants,
+ 					      &write_cache_variants,
+ 					      &update_cache_variants),
+ 		     0,
+-		     SPINAND_ECCINFO(&w25n02kv_ooblayout, w25n02kv_ecc_get_status)),
++		     SPINAND_ECCINFO(&w25m02gv_ooblayout, NULL)),
+ 	SPINAND_INFO("W25N01JW",
+ 		     SPINAND_ID(SPINAND_READID_METHOD_OPCODE_DUMMY, 0xbc, 0x21),
+ 		     NAND_MEMORG(1, 2048, 64, 64, 1024, 20, 1, 1, 1),
+
+diff --git a/drivers/spi/Kconfig b/drivers/spi/Kconfig
+index cda333f226b6..c4779a0e3a53 100644
+--- a/drivers/spi/Kconfig
++++ b/drivers/spi/Kconfig
+@@ -467,6 +467,26 @@ config SPI_INGENIC
+ 	  To compile this driver as a module, choose M here: the module
+ 	  will be called spi-ingenic.
+ 
++config SPI_INGENIC_NOUVEAU
++	tristate "Ingenic X series SoCs SPI controller"
++	depends on MACH_INGENIC || COMPILE_TEST
++	help
++	  SPI controller driver for the Ingenic X series SoCs. It solved
++	  many problems of the old driver. It probably won't work on the
++	  old JZ series SoCs.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called spi-ingenic-nouveau.
++
++config SPI_INGENIC_SFC
++	tristate "Ingenic SPI Flash Controller"
++	depends on MACH_INGENIC || COMPILE_TEST
++	help
++	  This enables support for the Ingenic SPI flash controller.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called spi-ingenic-sfc.
++
+ config SPI_INTEL
+ 	tristate
+ 
+@@ -1202,6 +1222,22 @@ config SPI_SPIDEV
+ 	help
+ 	  This supports user mode SPI protocol drivers.
+ 
++	  Note that this application programming interface is EXPERIMENTAL
++	  and hence SUBJECT TO CHANGE WITHOUT NOTICE while it stabilizes.
++
++config SPI_SPIDEV_ZEROCOPY
++	tristate "User mode SPI device driver support (zero copy)"
++	depends on !SPI_SPIDEV
++	help
++	  This supports user mode SPI protocol drivers, but it tries to map
++	  user pages in the kernel side instead of copying them. YMMV if you
++	  have highmem but your DMA controller can't access them.
++
++	  Only the ioctl(SPI_IOC_MESSAGE) interface is supported. And you'd
++	  better to use something like posix_memalign() in the userspace.
++
++	  If unsure, say N and use the one above.
++
+ config SPI_LOOPBACK_TEST
+ 	tristate "spi loopback test framework support"
+ 	depends on m
+
+diff --git a/drivers/spi/Makefile b/drivers/spi/Makefile
+index 6af54842b9fa..0bd7eb069544 100644
+--- a/drivers/spi/Makefile
++++ b/drivers/spi/Makefile
+@@ -11,6 +11,7 @@ obj-$(CONFIG_SPI_MASTER)		+= spi.o
+ obj-$(CONFIG_SPI_MEM)			+= spi-mem.o
+ obj-$(CONFIG_SPI_MUX)			+= spi-mux.o
+ obj-$(CONFIG_SPI_SPIDEV)		+= spidev.o
++obj-$(CONFIG_SPI_SPIDEV_ZEROCOPY)	+= spidev-zerocopy.o
+ obj-$(CONFIG_SPI_LOOPBACK_TEST)		+= spi-loopback-test.o
+ 
+ # SPI master controller drivers (bus)
+@@ -66,6 +67,8 @@ obj-$(CONFIG_SPI_HISI_SFC_V3XX)		+= spi-hisi-sfc-v3xx.o
+ obj-$(CONFIG_SPI_IMG_SPFI)		+= spi-img-spfi.o
+ obj-$(CONFIG_SPI_IMX)			+= spi-imx.o
+ obj-$(CONFIG_SPI_INGENIC)		+= spi-ingenic.o
++obj-$(CONFIG_SPI_INGENIC_NOUVEAU)	+= spi-ingenic-nouveau.o
++obj-$(CONFIG_SPI_INGENIC_SFC)		+= spi-ingenic-sfc.o
+ obj-$(CONFIG_SPI_INTEL)			+= spi-intel.o
+ obj-$(CONFIG_SPI_INTEL_PCI)		+= spi-intel-pci.o
+ obj-$(CONFIG_SPI_INTEL_PLATFORM)	+= spi-intel-platform.o
+
+diff --git a/drivers/spi/spi-ingenic-nouveau.c b/drivers/spi/spi-ingenic-nouveau.c
+new file mode 100644
+index 000000000000..b407342f5ee3
+--- /dev/null
++++ b/drivers/spi/spi-ingenic-nouveau.c
+@@ -0,0 +1,912 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * SPI bus driver for the Ingenic X series SoCs
++ *
++ * Copyright (c) 2022-2023 ReimuNotMoe <reimu@sudomaker.com>
++ *
++ * Based on spi-ingenic.c
++ */
++
++// Important Note: If you're confused, please read:
++// Documentation/spi/spi-ingenic-nouveau.rst before you question your life
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/dmaengine.h>
++#include <linux/dma-mapping.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/of_device.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/interrupt.h>
++#include <linux/spi/spi.h>
++
++#define REG_SSIDR	0x0
++#define REG_SSICR0	0x4
++#define REG_SSICR1	0x8
++#define REG_SSISR	0xc
++#define REG_SSIGR	0x18
++#define REG_SSIRCNT	0x1c
++
++#define REG_SSICR0_TENDIAN_MASK		(BIT(19) | BIT(18))
++#define REG_SSICR0_TENDIAN_POS		18
++#define REG_SSICR0_RENDIAN_MASK		(BIT(17) | BIT(16))
++#define REG_SSICR0_RENDIAN_POS		16
++#define REG_SSICR0_TENDIAN_LSB		BIT(19)
++#define REG_SSICR0_RENDIAN_LSB		BIT(17)
++#define REG_SSICR0_SSIE			BIT(15)
++#define REG_SSICR0_TIE			BIT(14)
++#define REG_SSICR0_RIE			BIT(13)
++#define REG_SSICR0_TEIE			BIT(12)
++#define REG_SSICR0_REIE			BIT(11)
++#define REG_SSICR0_LOOP			BIT(10)
++#define REG_SSICR0_RFINC		BIT(8)
++#define REG_SSICR0_EACLRUN		BIT(7)
++#define REG_SSICR0_FSEL			BIT(6)
++#define REG_SSICR0_TFLUSH		BIT(2)
++#define REG_SSICR0_RFLUSH		BIT(1)
++#define REG_SSICR0_DISREV		BIT(0)
++
++#define REG_SSICR1_FRMHL_MASK		(BIT(31) | BIT(30))
++#define REG_SSICR1_FRMHL		BIT(30)
++#define REG_SSICR1_LFST			BIT(25)
++#define REG_SSICR1_UNFIN		BIT(23)
++#define REG_SSICR1_TTRG_POS		16
++#define REG_SSICR1_TTRG_MASK		(0xf << REG_SSICR1_TTRG_POS)
++#define REG_SSICR1_RTRG_POS		8
++#define REG_SSICR1_RTRG_MASK		(0xf << REG_SSICR1_RTRG_POS)
++#define REG_SSICR1_FLEN_POS		3
++#define REG_SSICR1_FLEN_MASK		(0x1f << REG_SSICR1_FLEN_POS)
++#define REG_SSICR1_PHA			BIT(1)
++#define REG_SSICR1_POL			BIT(0)
++
++#define REG_SSISR_TFIFONUM_POS		16
++#define REG_SSISR_TFIFONUM_MASK		(0xff << REG_SSISR_TFIFONUM_POS)
++#define REG_SSISR_RFIFONUM_POS		8
++#define REG_SSISR_RFIFONUM_MASK		(0xff << REG_SSISR_RFIFONUM_POS)
++#define REG_SSISR_END			BIT(7)
++#define REG_SSISR_BUSY			BIT(6)
++#define REG_SSISR_TFF			BIT(5)
++#define REG_SSISR_RFE			BIT(4)
++#define REG_SSISR_TFHE			BIT(3)
++#define REG_SSISR_RFHF			BIT(2)
++#define REG_SSISR_UNDR			BIT(1)
++#define REG_SSISR_OVER			BIT(0)
++
++#define SPI_INGENIC_FIFO_SIZE		128u
++#define SPI_INGENIC_FIFO_SIZE_HALF	(SPI_INGENIC_FIFO_SIZE / 2)
++
++struct jz_soc_info {
++	u32 bits_per_word_mask;
++	struct reg_field flen_field;
++	bool has_trendian;
++
++	unsigned int max_speed_hz;
++	unsigned int max_native_cs;
++};
++
++// The regmap API has some overhead, and like LWN said, it's designed
++// for SLOW things. In order to be FAST, we need this cache.
++struct ingenic_spi_hw_params_cache {
++	unsigned int speed_hz, bits;
++	u32 cr0_msg, cr1_msg;
++};
++
++// Mainly used by PIO logic. Also used for DMA setup.
++struct ingenic_spi_cur_xfer {
++	const void *txbuf;
++	void *rxbuf;
++	unsigned int element_size, len, last_xfer_len;
++	unsigned int txpos, rxpos;
++};
++
++struct ingenic_spi {
++	struct device *dev;
++	const struct jz_soc_info *soc_info;
++	struct clk *clk;
++	struct resource *mem_res;
++
++	struct regmap *map;
++	struct regmap_field *flen_field;
++
++	int irq;
++	struct completion compl_fifo_empty;
++	struct completion compl_xfer_done;
++
++	struct ingenic_spi_cur_xfer cur_xfer;
++	struct ingenic_spi_hw_params_cache hw_params_cache;
++};
++
++static void spi_ingenic_set_cs(struct spi_device *spi, bool disable)
++{
++	struct ingenic_spi *priv = spi_controller_get_devdata(spi->controller);
++
++	if (spi->mode & SPI_CS_HIGH)
++		disable = !disable;
++
++	// Note: FIFO empty detection is moved to spi_ingenic_finish_transfer()
++	// In order to support GPIO CS correctly.
++
++	// Again: read the spi-ingenic-nouveau.rst doc if you're confused!
++
++	if (disable) {
++		regmap_clear_bits(priv->map, REG_SSICR1, REG_SSICR1_UNFIN);
++		regmap_clear_bits(priv->map, REG_SSISR, REG_SSISR_UNDR | REG_SSISR_OVER);
++	} else {
++		regmap_set_bits(priv->map, REG_SSICR1, REG_SSICR1_UNFIN);
++	}
++}
++
++static void spi_ingenic_finish_transfer(struct ingenic_spi *priv,
++					 struct spi_device *spi,
++					 struct spi_transfer *xfer) {
++
++	// Here's the tricky part:
++	// Only the hardware CS is controlled by set_cs(). For the GPIO CS,
++	// they're changed by gpiod_*() right after transfer_one() returns.
++
++	// Since the UNFIN only controls the hardware CS, we don't even need
++	// to bother to clear it here.
++
++	// So now here becomes a central point to ensure the FIFOs are flushed.
++	// It's no longer in set_cs().
++
++	// It's less efficient, but what else can we do?
++
++	// TODO: Do we need to wait 1 extra FIFO time to eliminate the possible
++	// delay from FIFO to the shift register connected to hardware pins?
++	// If so, it's only needed when using GPIO CS.
++
++	long ret;
++
++	regmap_set_bits(priv->map, REG_SSICR0, REG_SSICR0_TEIE);
++
++	// 12 hours wasted here:
++	// Nobody cared to document why the fuck you can't use wait_for_completion_interruptible here.
++
++	// If you look at other SPI drivers, you'll see they use either wait_for_completion_timeout
++	// or wait_for_completion. But nobody knows why. They probably just copied each other.
++
++	ret = wait_for_completion_timeout(&priv->compl_fifo_empty, msecs_to_jiffies(15000));
++
++	if (ret == 0) {
++		dev_err(priv->dev, "SPI operation timed out");
++		regmap_clear_bits(priv->map, REG_SSICR0, REG_SSICR0_TEIE);
++		reinit_completion(&priv->compl_fifo_empty);
++	}
++
++
++	priv->cur_xfer.txbuf = NULL;
++	priv->cur_xfer.rxbuf = NULL;
++}
++
++static void spi_ingenic_dma_finished_tx(void *controller)
++{
++	struct ingenic_spi *priv = spi_controller_get_devdata(controller);
++
++	if (priv->cur_xfer.txbuf) {
++		if (!priv->cur_xfer.rxbuf) {
++			complete(&priv->compl_xfer_done);
++		}
++	}
++}
++
++static void spi_ingenic_dma_finished_rx(void *controller)
++{
++	struct ingenic_spi *priv = spi_controller_get_devdata(controller);
++
++	if (priv->cur_xfer.rxbuf) {
++		complete(&priv->compl_xfer_done);
++	}
++}
++
++static struct dma_async_tx_descriptor *
++spi_ingenic_prepare_dma(struct spi_controller *ctlr, struct dma_chan *chan,
++			struct sg_table *sg, enum dma_transfer_direction dir,
++			unsigned int bits)
++{
++	struct ingenic_spi *priv = spi_controller_get_devdata(ctlr);
++	struct dma_slave_config cfg = {
++		.direction = dir,
++		.src_addr = priv->mem_res->start + REG_SSIDR,
++		.dst_addr = priv->mem_res->start + REG_SSIDR,
++	};
++	struct dma_async_tx_descriptor *desc;
++	dma_cookie_t cookie;
++	int ret;
++
++	if (bits > 16) {
++		cfg.src_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
++		cfg.dst_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
++		cfg.src_maxburst = 4;
++	} else if (bits > 8) {
++		cfg.src_addr_width = DMA_SLAVE_BUSWIDTH_2_BYTES;
++		cfg.dst_addr_width = DMA_SLAVE_BUSWIDTH_2_BYTES;
++		cfg.src_maxburst = 2;
++	} else {
++		cfg.src_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE;
++		cfg.dst_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE;
++		cfg.src_maxburst = 1;
++	}
++
++	// This is for another errata.
++	if (dir == DMA_DEV_TO_MEM) {
++		cfg.src_maxburst = 1;
++	}
++
++	ret = dmaengine_slave_config(chan, &cfg);
++	if (ret)
++		return ERR_PTR(ret);
++
++	desc = dmaengine_prep_slave_sg(chan, sg->sgl, sg->nents, dir,
++				       DMA_PREP_INTERRUPT);
++	if (!desc)
++		return ERR_PTR(-ENOMEM);
++
++	if (dir == DMA_DEV_TO_MEM) {
++		desc->callback = spi_ingenic_dma_finished_rx;
++	} else {
++		desc->callback = spi_ingenic_dma_finished_tx;
++	}
++
++	desc->callback_param = ctlr;
++
++	cookie = dmaengine_submit(desc);
++
++	ret = dma_submit_error(cookie);
++	if (ret) {
++		dmaengine_desc_free(desc);
++		return ERR_PTR(ret);
++	}
++
++	return desc;
++}
++
++static int spi_ingenic_dma_transfer(struct spi_controller *ctlr,
++			      struct spi_transfer *xfer, unsigned int bits)
++{
++	struct ingenic_spi *priv = spi_controller_get_devdata(ctlr);
++	struct dma_async_tx_descriptor *rx_desc = NULL, *tx_desc = NULL;
++	u32 val, val2;
++
++	if (xfer->rx_buf) {
++		rx_desc = spi_ingenic_prepare_dma(ctlr, ctlr->dma_rx,
++						  &xfer->rx_sg, DMA_DEV_TO_MEM, bits);
++		if (IS_ERR(rx_desc)) {
++			return PTR_ERR(rx_desc);
++		}
++
++		val = (0x0 << REG_SSICR1_TTRG_POS) | (0x0 << REG_SSICR1_RTRG_POS);
++	} else {
++		val = (0xf << REG_SSICR1_TTRG_POS) | (0x0 << REG_SSICR1_RTRG_POS);
++	}
++
++	if (xfer->tx_buf) {
++		tx_desc = spi_ingenic_prepare_dma(ctlr, ctlr->dma_tx,
++						  &xfer->tx_sg, DMA_MEM_TO_DEV, bits);
++		if (IS_ERR(tx_desc)) {
++			if (rx_desc) {
++				dmaengine_terminate_async(ctlr->dma_rx);
++				dmaengine_desc_free(rx_desc);
++			}
++			return PTR_ERR(tx_desc);
++		}
++	}
++
++	val2 = REG_SSICR1_TTRG_MASK | REG_SSICR1_RTRG_MASK;
++	regmap_update_bits(priv->map, REG_SSICR1, val2, val);
++
++	if (rx_desc)
++		dma_async_issue_pending(ctlr->dma_rx);
++
++	if (tx_desc)
++		dma_async_issue_pending(ctlr->dma_tx);
++
++	if (wait_for_completion_timeout(&priv->compl_xfer_done, msecs_to_jiffies(15000)) == 0) {
++		dev_err(priv->dev, "DMA operation timed out, DMA driver is buggy or HW errata");
++		reinit_completion(&priv->compl_xfer_done);
++		return -ETIMEDOUT;
++	}
++
++	regmap_update_bits(priv->map, REG_SSICR1, val2, 0);
++
++	return 0;
++}
++
++static int spi_ingenic_pio_transfer(struct ingenic_spi *priv,
++			      struct spi_transfer *xfer, unsigned int bits)
++{
++	unsigned int element_size, count, tx_prefill_len;
++	unsigned int tx_remaining_len, rx_remaining_len;
++	unsigned int i, val, val2;
++
++	element_size = bits / 8;
++	count = xfer->len / element_size;
++	tx_prefill_len = xfer->tx_buf ? min(count, SPI_INGENIC_FIFO_SIZE) : 0;
++	tx_remaining_len = xfer->tx_buf ? count - tx_prefill_len : 0;
++	rx_remaining_len = xfer->rx_buf ? count : 0;
++
++	switch (bits) {
++		case 8: {
++			const u8 *buf = xfer->tx_buf;
++			for (i = 0; i < tx_prefill_len; i++) {
++				val = buf[i];
++				regmap_write(priv->map, REG_SSIDR, val);
++			}
++			break;
++		}
++		case 16: {
++			const u16 *buf = xfer->tx_buf;
++			for (i = 0; i < tx_prefill_len; i++) {
++				val = buf[i];
++				regmap_write(priv->map, REG_SSIDR, val);
++			}
++			break;
++		}
++		case 32: {
++			const u32 *buf = xfer->tx_buf;
++			for (i = 0; i < tx_prefill_len; i++) {
++				val = buf[i];
++				regmap_write(priv->map, REG_SSIDR, val);
++			}
++			break;
++		}
++		default:
++			return -EINVAL;
++	}
++
++	// We're finished here if it's TX only and the data fits
++	// in the entire FIFO
++	if ((tx_remaining_len == 0) && (rx_remaining_len == 0)) {
++		return 0;
++	}
++
++	// The journey continues...
++	priv->cur_xfer.element_size = element_size;
++	priv->cur_xfer.len = count;
++	priv->cur_xfer.txpos = count - tx_remaining_len;
++	priv->cur_xfer.rxpos = count - rx_remaining_len;
++
++	// Trigger at FIFO half empty
++	val = (0x8 << REG_SSICR1_TTRG_POS) | (0x0 << REG_SSICR1_RTRG_POS);
++	val2 = REG_SSICR1_TTRG_MASK | REG_SSICR1_RTRG_MASK;
++	regmap_update_bits(priv->map, REG_SSICR1, val2, val);
++
++
++	// Enable interrupts respectively
++	val = 0;
++
++	if (tx_remaining_len)
++		val |= REG_SSICR0_TIE;
++
++	if (rx_remaining_len)
++		val |= REG_SSICR0_RIE;
++
++	// Letsgooooooo
++	regmap_set_bits(priv->map, REG_SSICR0, val);
++
++	// Same as above. I'll just copy the behaviour of other SPI drivers.
++	if (wait_for_completion_timeout(&priv->compl_xfer_done, msecs_to_jiffies(15000)) == 0) {
++		dev_err(priv->dev, "PIO operation timed out, driver is buggy or HW errata");
++		return -ETIMEDOUT;
++	}
++
++	// At this point, TIE & RIE should be disabled
++	// Revert FIFO settings to 0/0 ensure correct detection of FIFO empty
++	regmap_update_bits(priv->map, REG_SSICR1, val2, 0);
++
++	return 0;
++}
++
++
++static void spi_ingenic_pio_do_tx(struct ingenic_spi *priv, unsigned int fifo_avail_len) {
++	unsigned int i, val;
++
++	unsigned int element_size = priv->cur_xfer.element_size;
++	unsigned int pos = priv->cur_xfer.txpos;
++	unsigned int remaining = priv->cur_xfer.len - priv->cur_xfer.txpos;
++	unsigned int transfer_len = min(fifo_avail_len, remaining);
++
++	switch (element_size) {
++		case 1: {
++			const u8 *buf = priv->cur_xfer.txbuf;
++			buf += pos;
++
++			for (i = 0; i < transfer_len; i++) {
++				val = buf[i];
++				regmap_write(priv->map, REG_SSIDR, val);
++			}
++			break;
++		}
++		case 2: {
++			const u16 *buf = priv->cur_xfer.txbuf;
++			buf += pos;
++
++			for (i = 0; i < transfer_len; i++) {
++				val = buf[i];
++				regmap_write(priv->map, REG_SSIDR, val);
++			}
++			break;
++		}
++		case 4: {
++			const u32 *buf = priv->cur_xfer.txbuf;
++			buf += pos;
++
++			for (i = 0; i < transfer_len; i++) {
++				val = buf[i];
++				regmap_write(priv->map, REG_SSIDR, val);
++			}
++			break;
++		}
++		default:
++			BUG();
++			break;
++	}
++
++	priv->cur_xfer.txpos += transfer_len;
++	priv->cur_xfer.last_xfer_len = transfer_len;
++}
++
++static void spi_ingenic_pio_do_rx(struct ingenic_spi *priv, unsigned int fifo_avail_len) {
++	unsigned int i, val;
++
++	unsigned int element_size = priv->cur_xfer.element_size;
++	unsigned int pos = priv->cur_xfer.rxpos;
++	unsigned int remaining = priv->cur_xfer.len - priv->cur_xfer.rxpos;
++	unsigned int transfer_len = min(fifo_avail_len, remaining);
++
++	switch (element_size) {
++		case 1: {
++			u8 *buf = priv->cur_xfer.rxbuf;
++			buf += pos;
++
++			for (i = 0; i < transfer_len; i++) {
++				regmap_read(priv->map, REG_SSIDR, &val);
++				buf[i] = val;
++			}
++			break;
++		}
++		case 2: {
++			u16 *buf = priv->cur_xfer.rxbuf;
++			buf += pos;
++
++			for (i = 0; i < transfer_len; i++) {
++				regmap_read(priv->map, REG_SSIDR, &val);
++				buf[i] = val;
++			}
++			break;
++		}
++		case 4: {
++			u32 *buf = priv->cur_xfer.rxbuf;
++			buf += pos;
++
++			for (i = 0; i < transfer_len; i++) {
++				regmap_read(priv->map, REG_SSIDR, &val);
++				buf[i] = val;
++			}
++			break;
++		}
++		default:
++			BUG();
++			break;
++	}
++
++	priv->cur_xfer.rxpos += transfer_len;
++}
++
++static irqreturn_t ingenic_spi_irq_handler(int irq, void *data)
++{
++	struct ingenic_spi *priv = data;
++	u32 ssisr, ssicr0, fifo_avail_len;
++
++	int stuff_done = 0;
++
++	// Get interrupt flags
++	regmap_read(priv->map, REG_SSISR, &ssisr);
++	regmap_read(priv->map, REG_SSICR0, &ssicr0);
++
++	// FIFO empty
++	if (ssisr & REG_SSISR_UNDR) {
++		if (ssicr0 & REG_SSICR0_TEIE) {
++			regmap_clear_bits(priv->map, REG_SSICR0, REG_SSICR0_TEIE);
++			regmap_clear_bits(priv->map, REG_SSISR, REG_SSISR_UNDR);
++			complete(&priv->compl_fifo_empty);
++			stuff_done++;
++		} else {
++			regmap_clear_bits(priv->map, REG_SSISR, REG_SSISR_UNDR);
++		}
++	}
++
++	// PIO RX
++	if ((ssicr0 & REG_SSICR0_RIE) && (ssisr & REG_SSISR_RFHF)) {
++		while (1) {
++			fifo_avail_len = (ssisr & REG_SSISR_RFIFONUM_MASK) >> REG_SSISR_RFIFONUM_POS;
++			if ((fifo_avail_len == 0) || (priv->cur_xfer.rxpos >= priv->cur_xfer.len))
++				break;
++			spi_ingenic_pio_do_rx(priv, fifo_avail_len);
++			regmap_read(priv->map, REG_SSISR, &ssisr);
++		}
++
++		if (priv->cur_xfer.rxpos >= priv->cur_xfer.len) {
++			regmap_clear_bits(priv->map, REG_SSICR0, REG_SSICR0_RIE);
++
++			if (priv->cur_xfer.txpos >= priv->cur_xfer.len) {
++				complete(&priv->compl_xfer_done);
++			}
++
++			if (priv->cur_xfer.rxpos > priv->cur_xfer.len) {
++				printk("wtf: %u %u\n", priv->cur_xfer.txpos, priv->cur_xfer.len);
++			}
++		}
++
++		stuff_done++;
++
++	}
++
++	// PIO TX
++	if ((ssicr0 & REG_SSICR0_TIE) && (ssisr & REG_SSISR_TFHE)) {
++		fifo_avail_len = SPI_INGENIC_FIFO_SIZE - ((ssisr & REG_SSISR_TFIFONUM_MASK) >> REG_SSISR_TFIFONUM_POS);
++
++		spi_ingenic_pio_do_tx(priv, fifo_avail_len);
++
++		if (priv->cur_xfer.txpos >= priv->cur_xfer.len) {
++			regmap_clear_bits(priv->map, REG_SSICR0, REG_SSICR0_TIE);
++
++			if (priv->cur_xfer.rxpos >= priv->cur_xfer.len) {
++				complete(&priv->compl_xfer_done);
++			}
++
++			if (priv->cur_xfer.txpos > priv->cur_xfer.len) {
++				printk("wTf: %u %u\n", priv->cur_xfer.txpos, priv->cur_xfer.len);
++			}
++		}
++
++		stuff_done++;
++	}
++
++	if (stuff_done == 0) {
++		printk("I did nothing!\n");
++	}
++
++	return IRQ_HANDLED;
++}
++
++static unsigned int spi_ingenic_prepare_transfer(struct ingenic_spi *priv,
++					 struct spi_device *spi,
++					 struct spi_transfer *xfer)
++{
++	unsigned int speed_hz = xfer->speed_hz ?: spi->max_speed_hz;
++	unsigned int bits = xfer->bits_per_word ?: spi->bits_per_word;
++	unsigned int bits_rounded_up;
++
++	// bits: bits with vaild data, should be put to FLEN
++	// bits_rounded_up: bits rounded to nearest byte
++
++	if (bits > 16)
++		bits_rounded_up = 32;
++	else if (bits > 8)
++		bits_rounded_up = 16;
++	else
++		bits_rounded_up = 8;
++
++	if (priv->hw_params_cache.bits != bits) {
++		regmap_clear_bits(priv->map, REG_SSICR0, REG_SSICR0_SSIE);
++		regmap_field_write(priv->flen_field, bits - 2);
++		regmap_set_bits(priv->map, REG_SSICR0, REG_SSICR0_SSIE);
++		priv->hw_params_cache.bits = bits;
++	}
++
++	if (priv->hw_params_cache.speed_hz != speed_hz) {
++		unsigned long clk_hz = clk_get_rate(priv->clk);
++		u32 cdiv;
++
++		cdiv = clk_hz / (speed_hz * 2);
++		cdiv = clamp(cdiv, 1u, 0x100u) - 1;
++
++		regmap_write(priv->map, REG_SSIGR, cdiv);
++		priv->hw_params_cache.speed_hz = speed_hz;
++	}
++
++	priv->cur_xfer.txbuf = xfer->tx_buf;
++	priv->cur_xfer.rxbuf = xfer->rx_buf;
++
++	if (xfer->rx_buf) {
++		regmap_clear_bits(priv->map, REG_SSICR0, REG_SSICR0_DISREV);
++	} else {
++		regmap_set_bits(priv->map, REG_SSICR0, REG_SSICR0_DISREV);
++	}
++
++	// FYI: In order to the job, the hardware CS is low now
++	regmap_set_bits(priv->map, REG_SSICR0, REG_SSICR0_RFLUSH | REG_SSICR0_TFLUSH);
++	regmap_set_bits(priv->map, REG_SSICR1, REG_SSICR1_UNFIN);
++
++	return bits_rounded_up;
++}
++
++static int spi_ingenic_transfer_one(struct spi_controller *ctlr,
++				    struct spi_device *spi,
++				    struct spi_transfer *xfer)
++{
++	struct ingenic_spi *priv = spi_controller_get_devdata(ctlr);
++	unsigned int bits = spi_ingenic_prepare_transfer(priv, spi, xfer);
++	int ret = -1;
++
++	if (ctlr->cur_msg_mapped && ctlr->can_dma && ctlr->can_dma(ctlr, spi, xfer)) {
++		ret = spi_ingenic_dma_transfer(ctlr, xfer, bits);
++		if (ret != 0) {
++			dev_warn(&ctlr->dev, "SPI DMA rejected: bits: %u, len: %zu, txbuf=%p, rxbuf=%p, txdma=%08x, rxdma=%08x\n",
++				bits, xfer->len, xfer->tx_buf, xfer->rx_buf, xfer->tx_dma, xfer->rx_dma);
++		}
++	}
++
++	if (ret < 0) {
++		ret = spi_ingenic_pio_transfer(priv, xfer, bits);
++	}
++
++	spi_ingenic_finish_transfer(priv, spi, xfer);
++
++	return ret;
++}
++
++static int spi_ingenic_prepare_message(struct spi_controller *ctlr,
++				       struct spi_message *message)
++{
++	struct ingenic_spi *priv = spi_controller_get_devdata(ctlr);
++	struct spi_device *spi = message->spi;
++
++	unsigned int cs = REG_SSICR1_FRMHL << spi->chip_select;
++	unsigned int ssicr0_mask = REG_SSICR0_LOOP | REG_SSICR0_FSEL;
++	unsigned int ssicr1_mask = REG_SSICR1_PHA | REG_SSICR1_POL | cs;
++	unsigned int ssicr0 = 0, ssicr1 = 0;
++
++	if (priv->soc_info->has_trendian) {
++		ssicr0_mask |= REG_SSICR0_TENDIAN_MASK | REG_SSICR0_RENDIAN_MASK;
++
++		if (spi->mode & SPI_LSB_FIRST)
++			ssicr0 |= REG_SSICR0_RENDIAN_LSB | REG_SSICR0_TENDIAN_LSB;
++	} else {
++		ssicr1_mask |= REG_SSICR1_LFST;
++
++		if (spi->mode & SPI_LSB_FIRST)
++			ssicr1 |= REG_SSICR1_LFST;
++	}
++
++	if (spi->mode & SPI_LOOP)
++		ssicr0 |= REG_SSICR0_LOOP;
++
++	if (spi->chip_select)
++		ssicr0 |= REG_SSICR0_FSEL;
++
++	if (spi->mode & SPI_CPHA)
++		ssicr1 |= REG_SSICR1_PHA;
++	if (spi->mode & SPI_CPOL)
++		ssicr1 |= REG_SSICR1_POL;
++	if (spi->mode & SPI_CS_HIGH)
++		ssicr1 |= cs;
++
++	if (priv->hw_params_cache.cr0_msg != ssicr0) {
++		regmap_update_bits(priv->map, REG_SSICR0, ssicr0_mask, ssicr0);
++		priv->hw_params_cache.cr0_msg = ssicr0;
++	}
++
++	if (priv->hw_params_cache.cr1_msg != ssicr1) {
++		regmap_update_bits(priv->map, REG_SSICR1, ssicr1_mask, ssicr1);
++		priv->hw_params_cache.cr1_msg = ssicr1;
++		priv->hw_params_cache.bits = 0;
++	}
++
++	return 0;
++}
++
++static bool spi_ingenic_can_dma(struct spi_controller *ctlr,
++				struct spi_device *spi,
++				struct spi_transfer *xfer)
++{
++	struct dma_slave_caps caps;
++	int ret;
++
++	ret = dma_get_slave_caps(ctlr->dma_tx, &caps);
++	if (ret) {
++		dev_err(&spi->dev, "Unable to get slave caps: %d\n", ret);
++		return false;
++	}
++
++	if (xfer->len > 128) {
++		return !caps.max_sg_burst ||
++			xfer->len <= caps.max_sg_burst * SPI_INGENIC_FIFO_SIZE;
++	} else {
++		return false;
++	}
++}
++
++static int spi_ingenic_request_dma(struct spi_controller *ctlr,
++				   struct device *dev)
++{
++	ctlr->dma_tx = dma_request_slave_channel(dev, "tx");
++	if (!ctlr->dma_tx)
++		return -ENODEV;
++
++	ctlr->dma_rx = dma_request_slave_channel(dev, "rx");
++
++	if (!ctlr->dma_rx)
++		return -ENODEV;
++
++	ctlr->can_dma = spi_ingenic_can_dma;
++
++	return 0;
++}
++
++static void spi_ingenic_release_dma(void *data)
++{
++	struct spi_controller *ctlr = data;
++
++	if (ctlr->dma_tx)
++		dma_release_channel(ctlr->dma_tx);
++	if (ctlr->dma_rx)
++		dma_release_channel(ctlr->dma_rx);
++}
++
++static const struct regmap_config spi_ingenic_regmap_config = {
++	.disable_locking = true,
++	.reg_bits = 32,
++	.val_bits = 32,
++	.reg_stride = 4,
++	.max_register = REG_SSIGR,
++};
++
++static int spi_ingenic_probe(struct platform_device *pdev)
++{
++	const struct jz_soc_info *pdata;
++	struct device *dev = &pdev->dev;
++	struct spi_controller *ctlr;
++	struct ingenic_spi *priv;
++	void __iomem *base;
++	int num_cs, ret;
++
++	pdata = of_device_get_match_data(dev);
++	if (!pdata) {
++		dev_err(dev, "Missing platform data.\n");
++		return -EINVAL;
++	}
++
++	ctlr = devm_spi_alloc_master(dev, sizeof(*priv));
++	if (!ctlr) {
++		dev_err(dev, "Unable to allocate SPI controller.\n");
++		return -ENOMEM;
++	}
++
++	priv = spi_controller_get_devdata(ctlr);
++	priv->dev = dev;
++	priv->soc_info = pdata;
++
++	priv->clk = devm_clk_get(dev, NULL);
++	if (IS_ERR(priv->clk)) {
++		return dev_err_probe(dev, PTR_ERR(priv->clk),
++				     "Unable to get clock.\n");
++	}
++
++	base = devm_platform_get_and_ioremap_resource(pdev, 0, &priv->mem_res);
++	if (IS_ERR(base))
++		return PTR_ERR(base);
++
++	priv->map = devm_regmap_init_mmio(dev, base, &spi_ingenic_regmap_config);
++	if (IS_ERR(priv->map))
++		return PTR_ERR(priv->map);
++
++	priv->flen_field = devm_regmap_field_alloc(dev, priv->map,
++						   pdata->flen_field);
++	if (IS_ERR(priv->flen_field))
++		return PTR_ERR(priv->flen_field);
++
++	priv->irq = platform_get_irq(pdev, 0);
++	if (priv->irq < 0)
++		return priv->irq;
++
++	if (device_property_read_u32(dev, "num-cs", &num_cs))
++		num_cs = pdata->max_native_cs;
++
++	platform_set_drvdata(pdev, ctlr);
++
++	ret = devm_request_irq(dev, priv->irq, ingenic_spi_irq_handler, 0, dev_name(dev), priv);
++	if (ret) {
++		dev_err(dev, "Failed to request irq %d, ret = %d\n", priv->irq, ret);
++		return ret;
++	}
++
++	init_completion(&priv->compl_fifo_empty);
++	init_completion(&priv->compl_xfer_done);
++
++	ctlr->prepare_message = spi_ingenic_prepare_message;
++	ctlr->set_cs = spi_ingenic_set_cs;
++	ctlr->transfer_one = spi_ingenic_transfer_one;
++	ctlr->mode_bits = SPI_MODE_3 | SPI_LSB_FIRST | SPI_LOOP | SPI_CS_HIGH;
++	ctlr->flags = SPI_CONTROLLER_MUST_TX;
++	ctlr->bits_per_word_mask = pdata->bits_per_word_mask;
++	ctlr->min_speed_hz = 32000; // Ensure one FIFO entry takes 1ms or less to finish for now
++	ctlr->max_speed_hz = pdata->max_speed_hz;
++	ctlr->use_gpio_descriptors = true;
++	ctlr->max_native_cs = pdata->max_native_cs;
++	ctlr->num_chipselect = num_cs;
++	ctlr->dev.of_node = pdev->dev.of_node;
++
++	if (spi_ingenic_request_dma(ctlr, dev))
++		dev_warn(dev, "DMA not available.\n");
++
++	ret = devm_add_action_or_reset(dev, spi_ingenic_release_dma, ctlr);
++	if (ret) {
++		dev_err(dev, "Unable to add action.\n");
++		return ret;
++	}
++
++	ret = devm_spi_register_controller(dev, ctlr);
++	if (ret)
++		dev_err(dev, "Unable to register SPI controller.\n");
++
++
++	ret = clk_prepare_enable(priv->clk);
++	if (ret)
++		return dev_err_probe(dev, PTR_ERR(priv->clk),
++				     "Unable to enable clock.\n");
++
++	regmap_write(priv->map, REG_SSICR0, REG_SSICR0_EACLRUN);
++	regmap_write(priv->map, REG_SSICR1, 0);
++	regmap_write(priv->map, REG_SSISR, 0);
++	regmap_set_bits(priv->map, REG_SSICR0, REG_SSICR0_SSIE);
++
++	return ret;
++}
++
++static int spi_ingenic_remove(struct platform_device *pdev)
++{
++	struct spi_controller *ctlr;
++	struct ingenic_spi *priv;
++
++	ctlr = platform_get_drvdata(pdev);
++	priv = spi_controller_get_devdata(ctlr);
++
++	regmap_clear_bits(priv->map, REG_SSICR0, REG_SSICR0_SSIE);
++	clk_disable_unprepare(priv->clk);
++
++	return 0;
++}
++
++
++static const struct jz_soc_info x1000_soc_info = {
++	.bits_per_word_mask = SPI_BPW_RANGE_MASK(2, 32),
++	.flen_field = REG_FIELD(REG_SSICR1, 3, 7),
++	.has_trendian = true,
++
++	.max_speed_hz = 150000000,
++	.max_native_cs = 2,
++};
++
++static const struct jz_soc_info x2000_soc_info = {
++	.bits_per_word_mask = SPI_BPW_RANGE_MASK(2, 32),
++	.flen_field = REG_FIELD(REG_SSICR1, 3, 7),
++	.has_trendian = true,
++
++	.max_speed_hz = 150000000,
++	.max_native_cs = 1,
++};
++
++static const struct of_device_id spi_ingenic_of_match[] = {
++	{ .compatible = "ingenic,x1000-spi", .data = &x1000_soc_info },
++	{ .compatible = "ingenic,x2000-spi", .data = &x2000_soc_info },
++	{}
++};
++MODULE_DEVICE_TABLE(of, spi_ingenic_of_match);
++
++static struct platform_driver spi_ingenic_driver = {
++	.driver = {
++		.name = "spi-ingenic-nouveau",
++		.of_match_table = spi_ingenic_of_match,
++	},
++	.probe = spi_ingenic_probe,
++	.remove = spi_ingenic_remove,
++};
++
++module_platform_driver(spi_ingenic_driver);
++MODULE_DESCRIPTION("SPI bus driver for the Ingenic X series SoCs");
++MODULE_AUTHOR("ReimuNotMoe <reimu@sudomaker.com>");
++MODULE_LICENSE("GPL");
+
+diff --git a/drivers/spi/spi-ingenic-sfc.c b/drivers/spi/spi-ingenic-sfc.c
+new file mode 100644
+index 000000000000..e81217846776
+--- /dev/null
++++ b/drivers/spi/spi-ingenic-sfc.c
+@@ -0,0 +1,711 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Ingenic SoCs SPI Flash Controller Driver
++ * Copyright (c) 2022 周琰杰 (Zhou Yanjie) <zhouyanjie@wanyeetech.com>
++ */
++
++#include <linux/bitfield.h>
++#include <linux/bitops.h>
++#include <linux/clk.h>
++#include <linux/completion.h>
++#include <linux/interrupt.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/mtd/mtd.h>
++#include <linux/of_device.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/spi/spi.h>
++#include <linux/spi/spi-mem.h>
++#include <linux/dmaengine.h>
++#include <linux/dma-mapping.h>
++
++/* SFC register offsets */
++#define SFC_REG_GLB						0x0000
++#define	SFC_REG_DEV_CONF				0x0004
++#define	SFC_REG_DEV_STA_EXP				0x0008
++#define	SFC_REG_DEV_STA_RT				0x000c
++#define	SFC_REG_DEV_STA_MSK				0x0010
++#define	SFC_REG_TRAN_CONF(n)			0x0014 + n * 4
++#define	SFC_REG_TRAN_CFG0(n)			0x0014 + n * 4
++#define	SFC_REG_TRAN_LEN				0x002c
++#define	SFC_REG_DEV_ADDR(n)				0x0030 + n * 4
++#define	SFC_REG_DEV_ADDR_PLUS(n)		0x0048 + n * 4
++#define	SFC_REG_MEM_ADDR				0x0060
++#define	SFC_REG_TRIG					0x0064
++#define	SFC_REG_SR						0x0068
++#define	SFC_REG_SCR						0x006c
++#define	SFC_REG_INTC					0x0070
++#define	SFC_REG_FSM						0x0074
++#define	SFC_REG_CGE						0x0078
++#define SFC_REG_TRAN_CFG1(n)			0x009c + n * 4
++#define	SFC_REG_DR						0x1000
++
++/* bits within the GLB register */
++#define GLB_TRAN_DIR_MASK				GENMASK(13, 13)
++#define GLB_TRAN_DIR_WRITE				0x1
++#define GLB_TRAN_DIR_READ				0x0
++#define GLB_THRESHOLD_MASK				GENMASK(12, 7)
++#define GLB_OP_MODE_MASK				GENMASK(6, 6)
++#define GLB_OP_MODE_DMA					0x1
++#define GLB_OP_MODE_SLAVE				0x0
++#define GLB_PHASE_NUM_MASK				GENMASK(5, 3)
++#define GLB_WP_EN						BIT(2)
++#define GLB_BURST_MD_MASK				GENMASK(1, 0)
++#define GLB_BURST_MD_INCR32				0x3
++#define GLB_BURST_MD_INCR16				0x2
++#define GLB_BURST_MD_INCR8				0x1
++#define GLB_BURST_MD_INCR4				0x0
++
++/* bits within the DEV_CONF register */
++#define DEV_CONF_SMP_DELAY_MASK			GENMASK(20, 16)
++#define	DEV_CONF_SMP_DELAY_180DEG		0x4
++#define	DEV_CONF_SMP_DELAY_HALF_CYCLE	0x1
++#define DEV_CONF_CMD_TYPE_MASK			GENMASK(15, 15)
++#define DEV_CONF_CMD_TYPE_16BIT			0x1
++#define DEV_CONF_CMD_TYPE_8BIT			0x0
++#define DEV_CONF_STA_TYPE_MASK			GENMASK(14, 13)
++#define DEV_CONF_THOLD_MASK				GENMASK(12, 11)
++#define DEV_CONF_TSETUP_MASK			GENMASK(10, 9)
++#define DEV_CONF_TSH_MASK				GENMASK(8, 5)
++#define DEV_CONF_CPHA					BIT(4)
++#define DEV_CONF_CPOL					BIT(3)
++#define DEV_CONF_CE_DL					BIT(2)
++#define DEV_CONF_HOLD_DL				BIT(1)
++#define DEV_CONF_WP_DL					BIT(0)
++
++/* bits within the TRAN_CONF(n) register */
++#define TRAN_CONF_TRAN_MODE_MASK		GENMASK(31, 29)
++#define	TRAN_CONF_ADDR_WIDTH_MASK		GENMASK(28, 26)
++#define TRAN_CONF_POLL_EN				BIT(25)
++#define TRAN_CONF_CMD_EN				BIT(24)
++#define TRAN_CONF_PHASE_FORMAT_MASK		GENMASK(23, 23)
++#define TRAN_CONF_DMY_BITS_MASK			GENMASK(22, 17)
++#define TRAN_CONF_DATA_EN				BIT(16)
++#define TRAN_CONF_CMD_MASK				GENMASK(15, 0)
++
++/* bits within the TRIG register */
++#define TRIG_FLUSH						BIT(2)
++#define TRIG_STOP						BIT(1)
++#define TRIG_START						BIT(0)
++
++/* bits within the SR register */
++#define SR_FIFO_NUM_MASK				GENMASK(22, 16)
++#define	SR_END							BIT(4)
++#define SR_TRAN_REQ						BIT(3)
++#define SR_RECE_REQ						BIT(2)
++#define SR_OVER							BIT(1)
++#define SR_UNDER						BIT(0)
++
++/* bits within the SCR register */
++#define	SCR_CLR_END						BIT(4)
++#define SCR_CLR_TREQ					BIT(3)
++#define SCR_CLR_RREQ					BIT(2)
++#define SCR_CLR_OVER					BIT(1)
++#define SCR_CLR_UNDER					BIT(0)
++
++/* bits within the INTC register */
++#define	INTC_MASK_END					BIT(4)
++#define INTC_MASK_TREQ					BIT(3)
++#define INTC_MASK_RREQ					BIT(2)
++#define INTC_MASK_OVER					BIT(1)
++#define INTC_MASK_UNDER					BIT(0)
++
++/* bits within the TRAN_CFG1(n) register */
++#define TRAN_CFG1_TRAN_MODE_MASK		GENMASK(7, 4)
++
++#define TRAN_MODE_STANDARD				0
++#define TRAN_MODE_DUAL_DATA				1
++#define TRAN_MODE_DUAL_IO				2
++#define TRAN_MODE_DUAL_FULL				3
++#define TRAN_MODE_QUAD_DATA				5
++#define TRAN_MODE_QUAD_IO				6
++#define TRAN_MODE_QUAD_FULL				7
++#define TRAN_MODE_OCTAL_DATA			9
++#define TRAN_MODE_OCTAL_IO				10
++#define TRAN_MODE_OCTAL_FULL			11
++
++#define SFC_TRANSFER_TIMEOUT			1000
++
++enum ingenic_sfc_version {
++	ID_X1000,
++	ID_X1600,
++	ID_X2000,
++};
++
++struct ingenic_soc_info {
++	enum ingenic_sfc_version version;
++
++	unsigned int max_bus_width;
++
++	const u32 tran_mode_mask;
++};
++
++struct ingenic_sfc {
++	const struct ingenic_soc_info *soc_info;
++
++	void __iomem *base;
++	struct device *dev;
++	struct clk *clk;
++	int irq;
++
++	struct completion completion;
++};
++
++static irqreturn_t ingenic_sfc_irq_handler(int irq, void *data)
++{
++	struct ingenic_sfc *sfc = data;
++
++	writel(0x1f, sfc->base + SFC_REG_INTC);
++
++	complete(&sfc->completion);
++
++	return IRQ_HANDLED;
++}
++
++static int ingenic_sfc_dma_eligible(struct ingenic_sfc *sfc, const struct spi_mem_op *op) {
++	const unsigned int dma_len = 4;
++
++	if (op->data.dir == SPI_MEM_NO_DATA)
++		return 0;
++
++	if (sfc->soc_info->version >= ID_X1600)
++		return 1;
++
++	if ((op->data.nbytes % dma_len) == 0) {
++		if (op->data.dir == SPI_MEM_DATA_IN) {
++			if (IS_ALIGNED(virt_to_phys(op->data.buf.in), dma_len)) {
++				return 1;
++			}
++		}
++		if (op->data.dir == SPI_MEM_DATA_OUT) {
++			if (IS_ALIGNED(virt_to_phys(op->data.buf.out), dma_len)) {
++				return 1;
++			}
++		}
++	}
++
++	return 0;
++}
++
++static int ingenic_sfc_adjust_op_size(struct spi_mem *mem, struct spi_mem_op *op)
++{
++	struct spi_device *spi = mem->spi;
++	struct ingenic_sfc *sfc = spi_controller_get_devdata(spi->master);
++
++	// if (!ingenic_sfc_dma_eligible(sfc, op)) {
++
++		if (op->data.nbytes > 64 * 4)
++				op->data.nbytes = 64 * 4;
++	// }
++
++	return 0;
++}
++
++static bool ingenic_sfc_supports_op(struct spi_mem *mem, const struct spi_mem_op *op)
++{
++	struct spi_device *spi = mem->spi;
++	struct ingenic_sfc *sfc = spi_controller_get_devdata(spi->master);
++
++	/* The controller only supports Standard SPI mode, Duall mode and Quad mode. */
++	if (op->cmd.buswidth > sfc->soc_info->max_bus_width ||
++		op->addr.buswidth > sfc->soc_info->max_bus_width ||
++		op->dummy.buswidth > sfc->soc_info->max_bus_width ||
++		op->data.buswidth > sfc->soc_info->max_bus_width) {
++		return false;
++}
++
++	/* Max 32 dummy clock cycles supported */
++	if (op->dummy.nbytes && (op->dummy.nbytes * 8 / op->dummy.buswidth > 32)){
++		return false;
++	}
++
++	/* Max rx data length, check controller limits and alignment */
++	if (op->data.dir == SPI_MEM_DATA_IN &&
++	   (op->data.nbytes > 64 * 4 && !IS_ALIGNED(op->data.nbytes, 4))){
++		return false;
++}
++
++	/* Max tx data length, check controller limits */
++	if (op->data.dir == SPI_MEM_DATA_OUT && op->data.nbytes > 64 * 4) {
++		return false;
++	}
++
++	/* Max 6 bytes address width supported */
++	if (op->addr.nbytes > 6) {
++		return false;
++	}
++
++	return spi_mem_default_supports_op(mem, op);
++}
++
++static void ingenic_sfc_set_transfer_mode(struct ingenic_sfc *sfc, const struct spi_mem_op *op)
++{
++	int val;
++
++	val = readl(sfc->base +
++			(sfc->soc_info->version >= ID_X1600 ? SFC_REG_TRAN_CFG1(0) : SFC_REG_TRAN_CONF(0)));
++	val &= ~sfc->soc_info->tran_mode_mask;
++	if (op->cmd.buswidth == 8)
++		val |= (TRAN_MODE_OCTAL_FULL << (ffs(sfc->soc_info->tran_mode_mask) - 1)) &
++				sfc->soc_info->tran_mode_mask;
++	else if (op->cmd.buswidth == 4)
++		val |= (TRAN_MODE_QUAD_FULL << (ffs(sfc->soc_info->tran_mode_mask) - 1)) &
++				sfc->soc_info->tran_mode_mask;
++	else if (op->cmd.buswidth == 2)
++		val |= (TRAN_MODE_DUAL_FULL << (ffs(sfc->soc_info->tran_mode_mask) - 1)) &
++				sfc->soc_info->tran_mode_mask;
++	else if (op->addr.buswidth == 8)
++		val |= (TRAN_MODE_OCTAL_IO << (ffs(sfc->soc_info->tran_mode_mask) - 1)) &
++				sfc->soc_info->tran_mode_mask;
++	else if (op->addr.buswidth == 4)
++		val |= (TRAN_MODE_QUAD_IO << (ffs(sfc->soc_info->tran_mode_mask) - 1)) &
++				sfc->soc_info->tran_mode_mask;
++	else if (op->addr.buswidth == 2)
++		val |= (TRAN_MODE_DUAL_IO << (ffs(sfc->soc_info->tran_mode_mask) - 1)) &
++				sfc->soc_info->tran_mode_mask;
++	else if (op->data.buswidth == 8)
++		val |= (TRAN_MODE_OCTAL_DATA << (ffs(sfc->soc_info->tran_mode_mask) - 1)) &
++				sfc->soc_info->tran_mode_mask;
++	else if (op->data.buswidth == 4)
++		val |= (TRAN_MODE_QUAD_DATA << (ffs(sfc->soc_info->tran_mode_mask) - 1)) &
++				sfc->soc_info->tran_mode_mask;
++	else if (op->data.buswidth == 2)
++		val |= (TRAN_MODE_DUAL_DATA << (ffs(sfc->soc_info->tran_mode_mask) - 1)) &
++				sfc->soc_info->tran_mode_mask;
++	else
++		val |= (TRAN_MODE_STANDARD << (ffs(sfc->soc_info->tran_mode_mask) - 1)) &
++				sfc->soc_info->tran_mode_mask;
++	writel(val, sfc->base +
++			(sfc->soc_info->version >= ID_X1600 ? SFC_REG_TRAN_CFG1(0) : SFC_REG_TRAN_CONF(0)));
++}
++
++/*
++ * memcpy_{to,from}io doesn't gurantee 32b accesses - which we require for the
++ * SFC_REG_DR register -so use __io{read,write}32_copy when possible. For
++ * trailing bytes, copy them byte-by-byte from the SFC_REG_DR register, as we
++ * can't clobber outside the source/dest buffer.
++ *
++ * For efficient data read/write, we try to put any start 32b unaligned data
++ * into a separate transaction in ingenic_sfc_adjust_op_size().
++ */
++static void ingenic_sfc_read_rxfifo(struct ingenic_sfc *sfc, u8 *to, unsigned int len)
++{
++	void __iomem *from;
++	int i;
++
++	from = sfc->base + SFC_REG_DR;
++
++	for (i = 0; i < DIV_ROUND_UP(len, 4); i++) {
++		u32 val = __raw_readl(from);
++		int j;
++
++		for (j = 0; j < 4 && (j + (i * 4) < len); to++, val >>= 8, j++)
++			*to = (u8)val;
++	}
++}
++
++static void ingenic_sfc_write_txfifo(struct ingenic_sfc *sfc, const u8 *from, unsigned int len)
++{
++	void __iomem *to;
++	int i;
++
++	to = sfc->base + SFC_REG_DR;
++
++	for (i = 0; i < DIV_ROUND_UP(len, 4); i++) {
++		u32 val = 0;
++		int j;
++
++		for (j = 0; j < 4 && (j + (i * 4) < len); from++, j++)
++			val |= *from << j * 8;
++		__raw_writel(val, to);
++	}
++}
++
++static int ingenic_sfc_exec_op_pio(struct ingenic_sfc *sfc, const struct spi_mem_op *op)
++{
++	int ret, val;
++
++	val = readl(sfc->base + SFC_REG_GLB);
++	u32p_replace_bits(&val,
++			op->data.dir == SPI_MEM_DATA_IN ? GLB_TRAN_DIR_READ : GLB_TRAN_DIR_WRITE,
++			GLB_TRAN_DIR_MASK);
++	u32p_replace_bits(&val, GLB_OP_MODE_SLAVE, GLB_OP_MODE_MASK);
++	writel(val, sfc->base + SFC_REG_GLB);
++
++	val = TRAN_CONF_CMD_EN | op->cmd.opcode;
++
++	if (op->addr.nbytes > 0) {
++		val |= FIELD_PREP(TRAN_CONF_ADDR_WIDTH_MASK, op->addr.nbytes);
++
++		writel(op->addr.val & 0xffffffff, sfc->base + SFC_REG_DEV_ADDR(0));
++		writel(op->addr.val >> 32, sfc->base + SFC_REG_DEV_ADDR_PLUS(0));
++	}
++
++	if (op->dummy.nbytes > 0)
++		val |= FIELD_PREP(TRAN_CONF_DMY_BITS_MASK, op->dummy.nbytes * 8 / op->dummy.buswidth);
++
++	if (op->data.nbytes > 0)
++		val |= TRAN_CONF_DATA_EN;
++
++	writel(val, sfc->base + SFC_REG_TRAN_CONF(0));
++	writel(op->data.nbytes, sfc->base + SFC_REG_TRAN_LEN);
++
++	ingenic_sfc_set_transfer_mode(sfc, op);
++
++	writel(0x1f, sfc->base + SFC_REG_SCR);
++	writel(~(INTC_MASK_END | INTC_MASK_RREQ), sfc->base + SFC_REG_INTC);
++
++	writel(0, sfc->base + SFC_REG_MEM_ADDR);
++
++	writel(TRIG_FLUSH, sfc->base + SFC_REG_TRIG);
++	writel(TRIG_START, sfc->base + SFC_REG_TRIG);
++
++	if (op->data.dir == SPI_MEM_DATA_OUT)
++		ingenic_sfc_write_txfifo(sfc, op->data.buf.out, op->data.nbytes);
++
++	ret = wait_for_completion_timeout(&sfc->completion, msecs_to_jiffies(SFC_TRANSFER_TIMEOUT));
++	if (!ret) {
++		writel(0x1f, sfc->base + SFC_REG_INTC);
++		writel(0x1f, sfc->base + SFC_REG_SCR);
++		dev_err(sfc->dev, "line:%d Timeout for ACK from SFC device\n", __LINE__);
++		return -ETIMEDOUT;
++	}
++
++	if (op->data.dir == SPI_MEM_DATA_IN) {
++		ingenic_sfc_read_rxfifo(sfc, op->data.buf.in, op->data.nbytes);
++		readl_poll_timeout(sfc->base + SFC_REG_SR, val, val & SR_END, 10, 0);
++	}
++
++	writel(INTC_MASK_END | INTC_MASK_RREQ, sfc->base + SFC_REG_SCR);
++	writel(TRIG_STOP, sfc->base + SFC_REG_TRIG);
++
++	return 0;
++}
++
++static int ingenic_sfc_exec_op_dma(struct ingenic_sfc *sfc, const struct spi_mem_op *op)
++{
++	int ret, val;
++
++	// printk(KERN_INFO "sfc_dma: nbytes = %u, dir = %d, addr = 0x%08lx\n", op->data.nbytes, op->data.dir, op->data.dir == SPI_MEM_DATA_IN ? (uintptr_t)op->data.buf.in : (uintptr_t)op->data.buf.out);
++
++	val = readl(sfc->base + SFC_REG_GLB);
++	u32p_replace_bits(&val,
++			op->data.dir == SPI_MEM_DATA_IN ? GLB_TRAN_DIR_READ : GLB_TRAN_DIR_WRITE,
++			GLB_TRAN_DIR_MASK);
++	u32p_replace_bits(&val, GLB_OP_MODE_DMA, GLB_OP_MODE_MASK);
++	writel(val, sfc->base + SFC_REG_GLB);
++
++	val = TRAN_CONF_CMD_EN | op->cmd.opcode;
++
++	if (op->addr.nbytes > 0) {
++		val |= FIELD_PREP(TRAN_CONF_ADDR_WIDTH_MASK, op->addr.nbytes);
++		writel(op->addr.val & 0xffffffff, sfc->base + SFC_REG_DEV_ADDR(0));
++		writel(op->addr.val >> 32, sfc->base + SFC_REG_DEV_ADDR_PLUS(0));
++	}
++
++	if (op->dummy.nbytes > 0)
++		val |= FIELD_PREP(TRAN_CONF_DMY_BITS_MASK, op->dummy.nbytes * 8 / op->dummy.buswidth);
++
++	if (op->data.nbytes > 0)
++		val |= TRAN_CONF_DATA_EN;
++
++	writel(val, sfc->base + SFC_REG_TRAN_CONF(0));
++	writel(op->data.nbytes, sfc->base + SFC_REG_TRAN_LEN);
++
++	ingenic_sfc_set_transfer_mode(sfc, op);
++
++	writel(0x1f, sfc->base + SFC_REG_SCR);
++	writel(~INTC_MASK_END, sfc->base + SFC_REG_INTC);
++
++	switch (op->data.dir) {
++	case SPI_MEM_DATA_IN:
++		writel(virt_to_phys(op->data.buf.in), sfc->base + SFC_REG_MEM_ADDR);
++		dma_sync_single_for_device(sfc->dev, virt_to_phys(op->data.buf.in),
++				op->data.nbytes, DMA_FROM_DEVICE);
++		break;
++
++	case SPI_MEM_DATA_OUT:
++		writel(virt_to_phys(op->data.buf.out), sfc->base + SFC_REG_MEM_ADDR);
++		dma_sync_single_for_device(sfc->dev, virt_to_phys(op->data.buf.out),
++				op->data.nbytes, DMA_TO_DEVICE);
++		break;
++
++	default:
++		return -EINVAL;
++	}
++
++	writel(TRIG_START, sfc->base + SFC_REG_TRIG);
++
++	ret = wait_for_completion_timeout(&sfc->completion, msecs_to_jiffies(SFC_TRANSFER_TIMEOUT));
++	if (!ret) {
++		writel(0x1f, sfc->base + SFC_REG_INTC);
++		writel(0x1f, sfc->base + SFC_REG_SCR);
++		dev_err(sfc->dev, "line:%d Timeout for ACK from SFC device\n", __LINE__);
++		return -ETIMEDOUT;
++	}
++
++	if (op->data.dir == SPI_MEM_DATA_IN)
++		dma_sync_single_for_cpu(sfc->dev, virt_to_phys(op->data.buf.in),
++				op->data.nbytes, DMA_FROM_DEVICE);
++
++	writel(INTC_MASK_END, sfc->base + SFC_REG_SCR);
++	writel(TRIG_STOP, sfc->base + SFC_REG_TRIG);
++
++	return 0;
++}
++
++static int ingenic_sfc_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
++{
++	struct spi_device *spi = mem->spi;
++	struct ingenic_sfc *sfc = spi_controller_get_devdata(spi->master);
++
++	//init_completion(&sfc->completion);
++
++	return ingenic_sfc_exec_op_pio(sfc, op);
++	// if (ingenic_sfc_dma_eligible(sfc, op))
++	// 	return ingenic_sfc_exec_op_dma(sfc, op);
++	// else
++	// 	return ingenic_sfc_exec_op_pio(sfc, op);
++}
++
++static int ingenic_sfc_poll_status(struct spi_mem *mem, const struct spi_mem_op *op,
++			u16 mask, u16 match, unsigned long initial_delay_us,
++			unsigned long polling_delay_us, unsigned long timeout_ms)
++{
++	struct spi_device *spi = mem->spi;
++	struct ingenic_sfc *sfc = spi_controller_get_devdata(spi->master);
++	int ret, val;
++
++	//init_completion(&sfc->completion);
++
++	val = readl(sfc->base + SFC_REG_GLB);
++	u32p_replace_bits(&val, GLB_TRAN_DIR_READ, GLB_TRAN_DIR_MASK);
++	u32p_replace_bits(&val, GLB_OP_MODE_SLAVE, GLB_OP_MODE_MASK);
++	writel(val, sfc->base + SFC_REG_GLB);
++
++	writel(match, sfc->base + SFC_REG_DEV_STA_EXP);
++	writel(mask, sfc->base + SFC_REG_DEV_STA_MSK);
++
++	val = TRAN_CONF_POLL_EN | TRAN_CONF_CMD_EN | op->cmd.opcode;
++
++	if (op->addr.nbytes > 0) {
++		val |= FIELD_PREP(TRAN_CONF_ADDR_WIDTH_MASK, op->addr.nbytes);
++
++		writel(op->addr.val & 0xffffffff, sfc->base + SFC_REG_DEV_ADDR(0));
++		writel(op->addr.val >> 32, sfc->base + SFC_REG_DEV_ADDR_PLUS(0));
++	}
++
++	if (op->dummy.nbytes > 0)
++		val |= FIELD_PREP(TRAN_CONF_DMY_BITS_MASK, op->dummy.nbytes * 8 / op->dummy.buswidth);
++
++	if (op->data.nbytes > 0)
++		val |= TRAN_CONF_DATA_EN;
++
++	writel(val, sfc->base + SFC_REG_TRAN_CONF(0));
++	writel(op->data.nbytes, sfc->base + SFC_REG_TRAN_LEN);
++
++	ingenic_sfc_set_transfer_mode(sfc, op);
++
++	writel(0x1f, sfc->base + SFC_REG_SCR);
++	writel(~INTC_MASK_END, sfc->base + SFC_REG_INTC);
++
++	writel(0, sfc->base + SFC_REG_MEM_ADDR);
++
++	writel(TRIG_START, sfc->base + SFC_REG_TRIG);
++
++	ret = wait_for_completion_timeout(&sfc->completion, msecs_to_jiffies(SFC_TRANSFER_TIMEOUT));
++	if (!ret) {
++		writel(0x1f, sfc->base + SFC_REG_INTC);
++		writel(0x1f, sfc->base + SFC_REG_SCR);
++		dev_err(sfc->dev, "line:%d Timeout for ACK from SFC device\n", __LINE__);
++		return -ETIMEDOUT;
++	}
++
++	writel(SCR_CLR_END, sfc->base + SFC_REG_SCR);
++	writel(TRIG_STOP, sfc->base + SFC_REG_TRIG);
++
++	return 0;
++}
++
++static const struct spi_controller_mem_ops ingenic_sfc_mem_ops = {
++	.adjust_op_size = ingenic_sfc_adjust_op_size,
++	.supports_op = ingenic_sfc_supports_op,
++	.exec_op = ingenic_sfc_exec_op,
++	.poll_status = ingenic_sfc_poll_status,
++};
++
++static int ingenic_sfc_setup(struct spi_device *spi)
++{
++	struct ingenic_sfc *sfc = spi_controller_get_devdata(spi->master);
++	unsigned long rate;
++	int ret, val;
++
++	if (!spi->max_speed_hz)
++		return -EINVAL;
++
++	ret = clk_set_rate(sfc->clk, spi->max_speed_hz * 2);
++	if (ret)
++		return -EINVAL;
++
++	writel(TRIG_STOP, sfc->base + SFC_REG_TRIG);
++	writel(0, sfc->base + SFC_REG_DEV_CONF);
++
++	/* X1000 need set to 0, but X2000 can be set to 1 */
++	writel(0, sfc->base + SFC_REG_CGE);
++
++	val = readl(sfc->base + SFC_REG_GLB);
++	u32p_replace_bits(&val, 64 - 1, GLB_THRESHOLD_MASK);
++	u32p_replace_bits(&val, GLB_BURST_MD_INCR8, GLB_BURST_MD_MASK);
++	writel(val, sfc->base + SFC_REG_GLB);
++
++	val = readl(sfc->base + SFC_REG_DEV_CONF);
++
++	/* cpha bit:0 , cpol bit:0 */
++	val &= ~(DEV_CONF_CPHA | DEV_CONF_CPOL);
++	val |= spi->mode & SPI_CPHA ? DEV_CONF_CPHA : 0;
++	val |= spi->mode & SPI_CPOL ? DEV_CONF_CPOL : 0;
++
++	/* ce_dl bit:1, hold bit:1, wp bit:1 */
++	val |= (DEV_CONF_CE_DL | DEV_CONF_HOLD_DL | DEV_CONF_WP_DL);
++
++	writel(val, sfc->base + SFC_REG_DEV_CONF);
++
++	val = readl(sfc->base + SFC_REG_GLB);
++	u32p_replace_bits(&val, GLB_OP_MODE_SLAVE, GLB_OP_MODE_MASK);
++	writel(val, sfc->base + SFC_REG_GLB);
++
++	rate = clk_get_rate(sfc->clk);
++	val = readl(sfc->base + SFC_REG_DEV_CONF);
++	if (sfc->soc_info->version >= ID_X1600 && rate >= 200000000)
++		u32p_replace_bits(&val, DEV_CONF_SMP_DELAY_180DEG, DEV_CONF_SMP_DELAY_MASK);
++	else if (sfc->soc_info->version == ID_X1000 && rate >= 100000000)
++		u32p_replace_bits(&val, DEV_CONF_SMP_DELAY_HALF_CYCLE, DEV_CONF_SMP_DELAY_MASK);
++	writel(val, sfc->base + SFC_REG_DEV_CONF);
++
++	return 0;
++}
++
++static int ingenic_sfc_probe(struct platform_device *pdev)
++{
++	struct ingenic_sfc *sfc;
++	struct spi_controller *ctlr;
++	int ret;
++
++	ctlr = spi_alloc_master(&pdev->dev, sizeof(*sfc));
++	if (!ctlr)
++		return -ENOMEM;
++
++	sfc = spi_controller_get_devdata(ctlr);
++
++	sfc->soc_info = of_device_get_match_data(&pdev->dev);
++	if (!sfc->soc_info) {
++		dev_err(&pdev->dev, "No of match data provided\n");
++		ret = -ENODEV;
++		goto err_put_master;
++	}
++
++	sfc->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(sfc->base)) {
++		ret = PTR_ERR(sfc->base);
++		goto err_put_master;
++	}
++
++	sfc->clk = devm_clk_get(&pdev->dev, "sfc");
++	if (IS_ERR(sfc->clk)) {
++		ret = IS_ERR(sfc->clk);
++		goto err_put_master;
++	}
++
++	ret = clk_prepare_enable(sfc->clk);
++	if (ret)
++		goto err_put_master;
++
++	sfc->irq = platform_get_irq(pdev, 0);
++	if (sfc->irq < 0) {
++		ret = sfc->irq;
++		goto err_put_master;
++	}
++
++	sfc->dev = &pdev->dev;
++
++	platform_set_drvdata(pdev, sfc);
++
++	ret = devm_request_irq(&pdev->dev, sfc->irq, ingenic_sfc_irq_handler, 0,
++			dev_name(&pdev->dev), sfc);
++	if (ret) {
++		dev_err(&pdev->dev, "Failed to request irq%d, ret = %d\n", sfc->irq, ret);
++		goto err_put_master;
++	}
++
++	init_completion(&sfc->completion);
++
++	ctlr->bus_num = -1;
++	ctlr->num_chipselect = 1;
++	ctlr->mem_ops = &ingenic_sfc_mem_ops;
++	ctlr->dev.of_node = pdev->dev.of_node;
++	ctlr->setup = ingenic_sfc_setup;
++	ctlr->mode_bits = SPI_CPHA | SPI_CPOL |
++			SPI_RX_DUAL | SPI_RX_QUAD | SPI_TX_DUAL | SPI_TX_QUAD;
++	if (sfc->soc_info->version >= ID_X2000)
++		ctlr->mode_bits |= SPI_RX_OCTAL | SPI_TX_OCTAL;
++
++	ret = devm_spi_register_controller(&pdev->dev, ctlr);
++	if (ret)
++		goto err_put_master;
++
++	return 0;
++
++err_put_master:
++	spi_master_put(ctlr);
++
++	return ret;
++}
++
++static const struct ingenic_soc_info x1000_soc_info = {
++	.version = ID_X1000,
++
++	.max_bus_width = 4,
++
++	.tran_mode_mask = TRAN_CONF_TRAN_MODE_MASK,
++};
++
++static const struct ingenic_soc_info x1600_soc_info = {
++	.version = ID_X1600,
++
++	.max_bus_width = 4,
++
++	.tran_mode_mask = TRAN_CONF_TRAN_MODE_MASK,
++};
++
++static const struct ingenic_soc_info x2000_soc_info = {
++	.version = ID_X2000,
++
++	.max_bus_width = 8,
++
++	.tran_mode_mask = TRAN_CFG1_TRAN_MODE_MASK,
++};
++
++static const struct of_device_id ingenic_sfc_of_matches[] = {
++	{ .compatible = "ingenic,x1000-sfc", .data = &x1000_soc_info },
++	{ .compatible = "ingenic,x1600-sfc", .data = &x1600_soc_info },
++	{ .compatible = "ingenic,x1700-sfc", .data = &x1600_soc_info },
++	{ .compatible = "ingenic,x1830-sfc", .data = &x1000_soc_info },
++	{ .compatible = "ingenic,x2000-sfc", .data = &x2000_soc_info },
++	{ .compatible = "ingenic,x2500-sfc", .data = &x2000_soc_info },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, ingenic_sfc_of_matches);
++
++static struct platform_driver ingenic_sfc_driver = {
++	.driver = {
++		.name = "ingenic-sfc",
++		.of_match_table = ingenic_sfc_of_matches,
++	},
++	.probe = ingenic_sfc_probe,
++};
++module_platform_driver(ingenic_sfc_driver);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("周琰杰 (Zhou Yanjie) <zhouyanjie@wanyeetech.com>");
++MODULE_DESCRIPTION("Ingenic SoCs SPI Flash Controller Driver");
+
+diff --git a/drivers/spi/spidev-zerocopy.c b/drivers/spi/spidev-zerocopy.c
+new file mode 100644
+index 000000000000..b58d09ad24b8
+--- /dev/null
++++ b/drivers/spi/spidev-zerocopy.c
+@@ -0,0 +1,967 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Zero copy spidev driver
++ *
++ * Copyright (C) 2023 Reimu NotMoe <reimu@sudomaker.com>
++ *
++ * Based on the original spidev driver.
++ */
++
++#include <linux/init.h>
++#include <linux/ioctl.h>
++#include <linux/fs.h>
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/list.h>
++#include <linux/errno.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/property.h>
++#include <linux/slab.h>
++#include <linux/compat.h>
++#include <linux/vmalloc.h>
++
++#include <linux/spi/spi.h>
++#include <linux/spi/spidev.h>
++
++#include <linux/uaccess.h>
++
++
++/*
++ * This supports access to SPI devices using normal userspace I/O calls.
++ * Note that while traditional UNIX/POSIX I/O semantics are half duplex,
++ * and often mask message boundaries, full SPI support requires full duplex
++ * transfers.  There are several kinds of internal message boundaries to
++ * handle chipselect management and other protocol options.
++ *
++ * SPI has a character major number assigned.  We allocate minor numbers
++ * dynamically using a bitmask.  You must use hotplug tools, such as udev
++ * (or mdev with busybox) to create and destroy the /dev/spidevB.C device
++ * nodes, since there is no fixed association of minor numbers with any
++ * particular SPI bus or device.
++ */
++#define SPIDEV_MAJOR			153	/* assigned */
++#define N_SPI_MINORS			32	/* ... up to 256 */
++
++static DECLARE_BITMAP(minors, N_SPI_MINORS);
++
++static_assert(N_SPI_MINORS > 0 && N_SPI_MINORS <= 256);
++
++/* Bit masks for spi_device.mode management.  Note that incorrect
++ * settings for some settings can cause *lots* of trouble for other
++ * devices on a shared bus:
++ *
++ *  - CS_HIGH ... this device will be active when it shouldn't be
++ *  - 3WIRE ... when active, it won't behave as it should
++ *  - NO_CS ... there will be no explicit message boundaries; this
++ *	is completely incompatible with the shared bus model
++ *  - READY ... transfers may proceed when they shouldn't.
++ *
++ * REVISIT should changing those flags be privileged?
++ */
++#define SPI_MODE_MASK		(SPI_MODE_X_MASK | SPI_CS_HIGH \
++				| SPI_LSB_FIRST | SPI_3WIRE | SPI_LOOP \
++				| SPI_NO_CS | SPI_READY | SPI_TX_DUAL \
++				| SPI_TX_QUAD | SPI_TX_OCTAL | SPI_RX_DUAL \
++				| SPI_RX_QUAD | SPI_RX_OCTAL \
++				| SPI_RX_CPHA_FLIP)
++
++struct spidev_data {
++	dev_t			devt;
++	spinlock_t		spi_lock;
++	struct spi_device	*spi;
++	struct list_head	device_entry;
++
++	/* TX/RX buffers are NULL unless this device is open (users > 0) */
++	struct mutex		buf_lock;
++	unsigned		users;
++	u8			*smol_tx_buffer;
++	u8			*smol_rx_buffer;
++	u32			speed_hz;
++};
++
++struct spidev_dio_mapping {
++	struct page **pages;
++	unsigned page_cnt;
++	void *vm_addr;
++};
++
++struct spidev_dio {
++	struct spi_transfer spi_xfer;
++	struct spidev_dio_mapping map_tx, map_rx;
++};
++
++static LIST_HEAD(device_list);
++static DEFINE_MUTEX(device_list_lock);
++
++static unsigned smol_bufsiz = 4096;
++module_param(smol_bufsiz, uint, S_IRUGO);
++MODULE_PARM_DESC(smol_bufsiz, "smol buffer size");
++
++/*-------------------------------------------------------------------------*/
++
++static ssize_t
++spidev_sync(struct spidev_data *spidev, struct spi_message *message)
++{
++	int status;
++	struct spi_device *spi;
++
++	spin_lock_irq(&spidev->spi_lock);
++	spi = spidev->spi;
++	spin_unlock_irq(&spidev->spi_lock);
++
++	if (spi == NULL)
++		status = -ESHUTDOWN;
++	else
++		status = spi_sync(spi, message);
++
++	if (status == 0)
++		status = message->actual_length;
++
++	return status;
++}
++
++/*-------------------------------------------------------------------------*/
++
++/* Read-only message with current device setup */
++static ssize_t
++spidev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
++{
++	return -ENOSYS;
++}
++
++/* Write-only message with current device setup */
++static ssize_t
++spidev_write(struct file *filp, const char __user *buf,
++		size_t count, loff_t *f_pos)
++{
++	return -ENOSYS;
++}
++
++static void calc_pages(unsigned long in_user_addr, unsigned in_user_len, unsigned *out_page_cnt, unsigned long *out_first_page_addr, unsigned *out_first_page_offset)
++{
++	unsigned page_cnt, first_page_offset;
++	unsigned long first_page_addr;
++
++	first_page_offset = in_user_addr % PAGE_SIZE;
++	first_page_addr = in_user_addr - first_page_offset;
++	page_cnt = ((first_page_offset + in_user_len - 1) / PAGE_SIZE) + 1;
++
++	if (out_page_cnt)
++		*out_page_cnt = page_cnt;
++
++	if (out_first_page_addr)
++		*out_first_page_addr = first_page_addr;
++
++	if (out_first_page_offset)
++		*out_first_page_offset = first_page_offset;
++}
++
++static void *spidev_dio_map_user(unsigned long user_addr, unsigned user_len, struct spidev_dio_mapping *dio_mapping) {
++	unsigned page_cnt, first_page_offset;
++	unsigned long first_page_addr;
++
++	long pup_rc = 0;
++	struct page **cur_pages = NULL;
++	void *vm_addr;
++
++	calc_pages(user_addr, user_len, &page_cnt, &first_page_addr, &first_page_offset);
++
++	cur_pages = kcalloc(page_cnt, sizeof(*cur_pages), GFP_KERNEL);
++	if (!cur_pages) {
++		goto bad_ending;
++	}
++
++	pup_rc = pin_user_pages(first_page_addr, page_cnt, 0, cur_pages, NULL);
++
++	if (pup_rc != page_cnt) {
++		pr_err("pin_user_pages: %ld != %u\n", pup_rc, page_cnt);
++		goto bad_ending;
++	}
++
++	vm_addr = vmap(cur_pages, page_cnt, 0, PAGE_KERNEL);
++	if (!vm_addr) {
++		pr_err("vmap failed\n");
++		goto bad_ending;
++	}
++
++	dio_mapping->pages = cur_pages;
++	dio_mapping->page_cnt = page_cnt;
++	dio_mapping->vm_addr = vm_addr;
++
++	return vm_addr + first_page_offset;
++
++bad_ending:
++	if (pup_rc > 0)
++		unpin_user_pages(cur_pages, pup_rc);
++
++	if (cur_pages)
++		kfree(cur_pages);
++
++	return NULL;
++}
++
++static void spidev_dio_unmap_user(struct spidev_dio_mapping *dio_mapping) {
++	if (dio_mapping->vm_addr)
++		vunmap(dio_mapping->vm_addr);
++
++	if (dio_mapping->pages) {
++		unpin_user_pages(dio_mapping->pages, dio_mapping->page_cnt);
++		kfree(dio_mapping->pages);
++	}
++}
++
++static int spidev_message_ginormous(struct spidev_data *spidev,
++		struct spi_ioc_transfer *u_xfers, unsigned n_xfers)
++{
++	struct spi_message	msg;
++	struct spidev_dio	*dios;
++
++	unsigned		total = 0;
++	int			status = -EFAULT;
++
++	spi_message_init(&msg);
++
++	dios = kcalloc(n_xfers, sizeof(*dios), GFP_KERNEL);
++	if (dios == NULL)
++		return -ENOMEM;
++
++	for (unsigned i=0; i<n_xfers; i++) {
++		struct spidev_dio *cur_dio = &dios[i];
++		struct spi_ioc_transfer *cur_uspi_xfer = &u_xfers[i];
++		struct spi_transfer *cur_kspi_xfer = &cur_dio->spi_xfer;
++
++		void *buf;
++
++		if (cur_uspi_xfer->len) {
++			total += cur_uspi_xfer->len;
++			cur_kspi_xfer->len = cur_uspi_xfer->len;
++
++			if (cur_uspi_xfer->tx_buf) {
++				buf = spidev_dio_map_user(cur_uspi_xfer->tx_buf, cur_uspi_xfer->len, &cur_dio->map_tx);
++
++				if (buf)
++					cur_kspi_xfer->tx_buf = buf;
++				else
++					goto end;
++			}
++
++			if (cur_uspi_xfer->rx_buf) {
++				buf = spidev_dio_map_user(cur_uspi_xfer->rx_buf, cur_uspi_xfer->len, &cur_dio->map_rx);
++
++				if (buf)
++					cur_kspi_xfer->rx_buf = buf;
++				else
++					goto end;
++			}
++		}
++
++		cur_kspi_xfer->cs_change = !!cur_uspi_xfer->cs_change;
++		cur_kspi_xfer->tx_nbits = cur_uspi_xfer->tx_nbits;
++		cur_kspi_xfer->rx_nbits = cur_uspi_xfer->rx_nbits;
++		cur_kspi_xfer->bits_per_word = cur_uspi_xfer->bits_per_word;
++		cur_kspi_xfer->delay.value = cur_uspi_xfer->delay_usecs;
++		cur_kspi_xfer->delay.unit = SPI_DELAY_UNIT_USECS;
++		cur_kspi_xfer->speed_hz = cur_uspi_xfer->speed_hz;
++		cur_kspi_xfer->word_delay.value = cur_uspi_xfer->word_delay_usecs;
++		cur_kspi_xfer->word_delay.unit = SPI_DELAY_UNIT_USECS;
++		if (!cur_kspi_xfer->speed_hz)
++			cur_kspi_xfer->speed_hz = spidev->speed_hz;
++
++		spi_message_add_tail(cur_kspi_xfer, &msg);
++	}
++
++	status = spidev_sync(spidev, &msg);
++
++end:
++	for (unsigned i=0; i<n_xfers; i++) {
++		struct spidev_dio *cur_dio = &dios[i];
++		spidev_dio_unmap_user(&cur_dio->map_tx);
++		spidev_dio_unmap_user(&cur_dio->map_rx);
++	}
++
++	kfree(dios);
++
++	if (status == 0)
++		status = total;
++
++	return status;
++}
++
++static int spidev_message_smol(struct spidev_data *spidev,
++		struct spi_ioc_transfer *u_xfers, unsigned n_xfers)
++{
++	struct spi_message	msg;
++	struct spi_transfer	*k_xfers;
++	struct spi_transfer	*k_tmp;
++	struct spi_ioc_transfer *u_tmp;
++	unsigned		n, total, tx_total, rx_total;
++	u8			*tx_buf, *rx_buf;
++	int			status = -EFAULT;
++
++	spi_message_init(&msg);
++	k_xfers = kcalloc(n_xfers, sizeof(*k_tmp), GFP_KERNEL);
++	if (k_xfers == NULL)
++		return -ENOMEM;
++
++	/* Construct spi_message, copying any tx data to bounce buffer.
++	 * We walk the array of user-provided transfers, using each one
++	 * to initialize a kernel version of the same transfer.
++	 */
++	tx_buf = spidev->smol_tx_buffer;
++	rx_buf = spidev->smol_rx_buffer;
++	total = 0;
++	tx_total = 0;
++	rx_total = 0;
++	for (n = n_xfers, k_tmp = k_xfers, u_tmp = u_xfers;
++			n;
++			n--, k_tmp++, u_tmp++) {
++		/* Ensure that also following allocations from rx_buf/tx_buf will meet
++		 * DMA alignment requirements.
++		 */
++		unsigned int len_aligned = ALIGN(u_tmp->len, ARCH_KMALLOC_MINALIGN);
++
++		k_tmp->len = u_tmp->len;
++
++		total += k_tmp->len;
++
++		if (u_tmp->rx_buf) {
++			/* this transfer needs space in RX bounce buffer */
++			rx_total += len_aligned;
++			if (rx_total > smol_bufsiz) {
++				status = -EMSGSIZE;
++				goto done;
++			}
++			k_tmp->rx_buf = rx_buf;
++			rx_buf += len_aligned;
++		}
++		if (u_tmp->tx_buf) {
++			/* this transfer needs space in TX bounce buffer */
++			tx_total += len_aligned;
++			if (tx_total > smol_bufsiz) {
++				status = -EMSGSIZE;
++				goto done;
++			}
++			k_tmp->tx_buf = tx_buf;
++			if (copy_from_user(tx_buf, (const u8 __user *)
++						(uintptr_t) u_tmp->tx_buf,
++					u_tmp->len))
++				goto done;
++			tx_buf += len_aligned;
++		}
++
++		k_tmp->cs_change = !!u_tmp->cs_change;
++		k_tmp->tx_nbits = u_tmp->tx_nbits;
++		k_tmp->rx_nbits = u_tmp->rx_nbits;
++		k_tmp->bits_per_word = u_tmp->bits_per_word;
++		k_tmp->delay.value = u_tmp->delay_usecs;
++		k_tmp->delay.unit = SPI_DELAY_UNIT_USECS;
++		k_tmp->speed_hz = u_tmp->speed_hz;
++		k_tmp->word_delay.value = u_tmp->word_delay_usecs;
++		k_tmp->word_delay.unit = SPI_DELAY_UNIT_USECS;
++		if (!k_tmp->speed_hz)
++			k_tmp->speed_hz = spidev->speed_hz;
++#ifdef VERBOSE
++		dev_dbg(&spidev->spi->dev,
++			"  xfer len %u %s%s%s%dbits %u usec %u usec %uHz\n",
++			k_tmp->len,
++			k_tmp->rx_buf ? "rx " : "",
++			k_tmp->tx_buf ? "tx " : "",
++			k_tmp->cs_change ? "cs " : "",
++			k_tmp->bits_per_word ? : spidev->spi->bits_per_word,
++			k_tmp->delay.value,
++			k_tmp->word_delay.value,
++			k_tmp->speed_hz ? : spidev->spi->max_speed_hz);
++#endif
++		spi_message_add_tail(k_tmp, &msg);
++	}
++
++	status = spidev_sync(spidev, &msg);
++	if (status < 0)
++		goto done;
++
++	/* copy any rx data out of bounce buffer */
++	for (n = n_xfers, k_tmp = k_xfers, u_tmp = u_xfers;
++			n;
++			n--, k_tmp++, u_tmp++) {
++		if (u_tmp->rx_buf) {
++			if (copy_to_user((u8 __user *)
++					(uintptr_t) u_tmp->rx_buf, k_tmp->rx_buf,
++					u_tmp->len)) {
++				status = -EFAULT;
++				goto done;
++			}
++		}
++	}
++	status = total;
++
++done:
++	kfree(k_xfers);
++	return status;
++}
++
++static int spidev_message(struct spidev_data *spidev,
++		struct spi_ioc_transfer *u_xfers, unsigned n_xfers)
++{
++	unsigned total_xfer_bytes = 0;
++
++	for (unsigned i=0; i<n_xfers; i++) {
++		struct spi_ioc_transfer *cur_uspi_xfer = &u_xfers[i];
++		total_xfer_bytes += cur_uspi_xfer->len;
++
++		/* Since the function returns the total length of transfers
++		 * on success, restrict the total to positive int values to
++		 * avoid the return value looking like an error.  Also check
++		 * each transfer length to avoid arithmetic overflow.
++		 */
++		if (total_xfer_bytes > INT_MAX || cur_uspi_xfer->len > INT_MAX) {
++			return -EMSGSIZE;
++		}
++	}
++
++	if (total_xfer_bytes == 0)
++		return 0;
++
++	if (total_xfer_bytes > smol_bufsiz)
++		return spidev_message_ginormous(spidev, u_xfers, n_xfers);
++	else
++		return spidev_message_smol(spidev, u_xfers, n_xfers);
++}
++
++static struct spi_ioc_transfer *
++spidev_get_ioc_message(unsigned int cmd, struct spi_ioc_transfer __user *u_ioc,
++		unsigned *n_ioc)
++{
++	u32	tmp;
++
++	/* Check type, command number and direction */
++	if (_IOC_TYPE(cmd) != SPI_IOC_MAGIC
++			|| _IOC_NR(cmd) != _IOC_NR(SPI_IOC_MESSAGE(0))
++			|| _IOC_DIR(cmd) != _IOC_WRITE)
++		return ERR_PTR(-ENOTTY);
++
++	tmp = _IOC_SIZE(cmd);
++	if ((tmp % sizeof(struct spi_ioc_transfer)) != 0)
++		return ERR_PTR(-EINVAL);
++	*n_ioc = tmp / sizeof(struct spi_ioc_transfer);
++	if (*n_ioc == 0)
++		return NULL;
++
++	/* copy into scratch area */
++	return memdup_user(u_ioc, tmp);
++}
++
++static long
++spidev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++	int			retval = 0;
++	struct spidev_data	*spidev;
++	struct spi_device	*spi;
++	u32			tmp;
++	unsigned		n_ioc;
++	struct spi_ioc_transfer	*ioc;
++
++	/* Check type and command number */
++	if (_IOC_TYPE(cmd) != SPI_IOC_MAGIC)
++		return -ENOTTY;
++
++	/* guard against device removal before, or while,
++	 * we issue this ioctl.
++	 */
++	spidev = filp->private_data;
++	spin_lock_irq(&spidev->spi_lock);
++	spi = spi_dev_get(spidev->spi);
++	spin_unlock_irq(&spidev->spi_lock);
++
++	if (spi == NULL)
++		return -ESHUTDOWN;
++
++	/* use the buffer lock here for triple duty:
++	 *  - prevent I/O (from us) so calling spi_setup() is safe;
++	 *  - prevent concurrent SPI_IOC_WR_* from morphing
++	 *    data fields while SPI_IOC_RD_* reads them;
++	 *  - SPI_IOC_MESSAGE needs the buffer locked "normally".
++	 */
++	mutex_lock(&spidev->buf_lock);
++
++	switch (cmd) {
++	/* read requests */
++	case SPI_IOC_RD_MODE:
++	case SPI_IOC_RD_MODE32:
++		tmp = spi->mode;
++
++		{
++			struct spi_controller *ctlr = spi->controller;
++
++			if (ctlr->use_gpio_descriptors && ctlr->cs_gpiods &&
++			    ctlr->cs_gpiods[spi->chip_select])
++				tmp &= ~SPI_CS_HIGH;
++		}
++
++		if (cmd == SPI_IOC_RD_MODE)
++			retval = put_user(tmp & SPI_MODE_MASK,
++					  (__u8 __user *)arg);
++		else
++			retval = put_user(tmp & SPI_MODE_MASK,
++					  (__u32 __user *)arg);
++		break;
++	case SPI_IOC_RD_LSB_FIRST:
++		retval = put_user((spi->mode & SPI_LSB_FIRST) ?  1 : 0,
++					(__u8 __user *)arg);
++		break;
++	case SPI_IOC_RD_BITS_PER_WORD:
++		retval = put_user(spi->bits_per_word, (__u8 __user *)arg);
++		break;
++	case SPI_IOC_RD_MAX_SPEED_HZ:
++		retval = put_user(spidev->speed_hz, (__u32 __user *)arg);
++		break;
++
++	/* write requests */
++	case SPI_IOC_WR_MODE:
++	case SPI_IOC_WR_MODE32:
++		if (cmd == SPI_IOC_WR_MODE)
++			retval = get_user(tmp, (u8 __user *)arg);
++		else
++			retval = get_user(tmp, (u32 __user *)arg);
++		if (retval == 0) {
++			struct spi_controller *ctlr = spi->controller;
++			u32	save = spi->mode;
++
++			if (tmp & ~SPI_MODE_MASK) {
++				retval = -EINVAL;
++				break;
++			}
++
++			if (ctlr->use_gpio_descriptors && ctlr->cs_gpiods &&
++			    ctlr->cs_gpiods[spi->chip_select])
++				tmp |= SPI_CS_HIGH;
++
++			tmp |= spi->mode & ~SPI_MODE_MASK;
++			spi->mode = tmp & SPI_MODE_USER_MASK;
++			retval = spi_setup(spi);
++			if (retval < 0)
++				spi->mode = save;
++			else
++				dev_dbg(&spi->dev, "spi mode %x\n", tmp);
++		}
++		break;
++	case SPI_IOC_WR_LSB_FIRST:
++		retval = get_user(tmp, (__u8 __user *)arg);
++		if (retval == 0) {
++			u32	save = spi->mode;
++
++			if (tmp)
++				spi->mode |= SPI_LSB_FIRST;
++			else
++				spi->mode &= ~SPI_LSB_FIRST;
++			retval = spi_setup(spi);
++			if (retval < 0)
++				spi->mode = save;
++			else
++				dev_dbg(&spi->dev, "%csb first\n",
++						tmp ? 'l' : 'm');
++		}
++		break;
++	case SPI_IOC_WR_BITS_PER_WORD:
++		retval = get_user(tmp, (__u8 __user *)arg);
++		if (retval == 0) {
++			u8	save = spi->bits_per_word;
++
++			spi->bits_per_word = tmp;
++			retval = spi_setup(spi);
++			if (retval < 0)
++				spi->bits_per_word = save;
++			else
++				dev_dbg(&spi->dev, "%d bits per word\n", tmp);
++		}
++		break;
++	case SPI_IOC_WR_MAX_SPEED_HZ: {
++		u32 save;
++
++		retval = get_user(tmp, (__u32 __user *)arg);
++		if (retval)
++			break;
++		if (tmp == 0) {
++			retval = -EINVAL;
++			break;
++		}
++
++		save = spi->max_speed_hz;
++
++		spi->max_speed_hz = tmp;
++		retval = spi_setup(spi);
++		if (retval == 0) {
++			spidev->speed_hz = tmp;
++			dev_dbg(&spi->dev, "%d Hz (max)\n", spidev->speed_hz);
++		}
++
++		spi->max_speed_hz = save;
++		break;
++	}
++	default:
++		/* segmented and/or full-duplex I/O request */
++		/* Check message and copy into scratch area */
++		ioc = spidev_get_ioc_message(cmd,
++				(struct spi_ioc_transfer __user *)arg, &n_ioc);
++		if (IS_ERR(ioc)) {
++			retval = PTR_ERR(ioc);
++			break;
++		}
++		if (!ioc)
++			break;	/* n_ioc is also 0 */
++
++		/* translate to spi_message, execute */
++		retval = spidev_message(spidev, ioc, n_ioc);
++		kfree(ioc);
++		break;
++	}
++
++	mutex_unlock(&spidev->buf_lock);
++	spi_dev_put(spi);
++	return retval;
++}
++
++#ifdef CONFIG_COMPAT
++static long
++spidev_compat_ioc_message(struct file *filp, unsigned int cmd,
++		unsigned long arg)
++{
++	struct spi_ioc_transfer __user	*u_ioc;
++	int				retval = 0;
++	struct spidev_data		*spidev;
++	struct spi_device		*spi;
++	unsigned			n_ioc, n;
++	struct spi_ioc_transfer		*ioc;
++
++	u_ioc = (struct spi_ioc_transfer __user *) compat_ptr(arg);
++
++	/* guard against device removal before, or while,
++	 * we issue this ioctl.
++	 */
++	spidev = filp->private_data;
++	spin_lock_irq(&spidev->spi_lock);
++	spi = spi_dev_get(spidev->spi);
++	spin_unlock_irq(&spidev->spi_lock);
++
++	if (spi == NULL)
++		return -ESHUTDOWN;
++
++	/* SPI_IOC_MESSAGE needs the buffer locked "normally" */
++	mutex_lock(&spidev->buf_lock);
++
++	/* Check message and copy into scratch area */
++	ioc = spidev_get_ioc_message(cmd, u_ioc, &n_ioc);
++	if (IS_ERR(ioc)) {
++		retval = PTR_ERR(ioc);
++		goto done;
++	}
++	if (!ioc)
++		goto done;	/* n_ioc is also 0 */
++
++	/* Convert buffer pointers */
++	for (n = 0; n < n_ioc; n++) {
++		ioc[n].rx_buf = (uintptr_t) compat_ptr(ioc[n].rx_buf);
++		ioc[n].tx_buf = (uintptr_t) compat_ptr(ioc[n].tx_buf);
++	}
++
++	/* translate to spi_message, execute */
++	retval = spidev_message(spidev, ioc, n_ioc);
++	kfree(ioc);
++
++done:
++	mutex_unlock(&spidev->buf_lock);
++	spi_dev_put(spi);
++	return retval;
++}
++
++static long
++spidev_compat_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++	if (_IOC_TYPE(cmd) == SPI_IOC_MAGIC
++			&& _IOC_NR(cmd) == _IOC_NR(SPI_IOC_MESSAGE(0))
++			&& _IOC_DIR(cmd) == _IOC_WRITE)
++		return spidev_compat_ioc_message(filp, cmd, arg);
++
++	return spidev_ioctl(filp, cmd, (unsigned long)compat_ptr(arg));
++}
++#else
++#define spidev_compat_ioctl NULL
++#endif /* CONFIG_COMPAT */
++
++static int spidev_open(struct inode *inode, struct file *filp)
++{
++	struct spidev_data	*spidev = NULL, *iter;
++	int			status = -ENXIO;
++
++	mutex_lock(&device_list_lock);
++
++	list_for_each_entry(iter, &device_list, device_entry) {
++		if (iter->devt == inode->i_rdev) {
++			status = 0;
++			spidev = iter;
++			break;
++		}
++	}
++
++	if (!spidev) {
++		pr_debug("spidev: nothing for minor %d\n", iminor(inode));
++		goto err_find_dev;
++	}
++
++	if (!spidev->smol_tx_buffer) {
++		spidev->smol_tx_buffer = kmalloc(smol_bufsiz, GFP_KERNEL);
++		if (!spidev->smol_tx_buffer) {
++			status = -ENOMEM;
++			goto err_find_dev;
++		}
++	}
++
++	if (!spidev->smol_rx_buffer) {
++		spidev->smol_rx_buffer = kmalloc(smol_bufsiz, GFP_KERNEL);
++		if (!spidev->smol_rx_buffer) {
++			status = -ENOMEM;
++			goto err_alloc_rx_buf;
++		}
++	}
++
++	spidev->users++;
++	filp->private_data = spidev;
++	stream_open(inode, filp);
++
++	mutex_unlock(&device_list_lock);
++	return 0;
++
++err_alloc_rx_buf:
++	kfree(spidev->smol_tx_buffer);
++	spidev->smol_tx_buffer = NULL;
++err_find_dev:
++	mutex_unlock(&device_list_lock);
++	return status;
++}
++
++static int spidev_release(struct inode *inode, struct file *filp)
++{
++	struct spidev_data	*spidev;
++	int			dofree;
++
++	mutex_lock(&device_list_lock);
++	spidev = filp->private_data;
++	filp->private_data = NULL;
++
++	spin_lock_irq(&spidev->spi_lock);
++	/* ... after we unbound from the underlying device? */
++	dofree = (spidev->spi == NULL);
++	spin_unlock_irq(&spidev->spi_lock);
++
++	/* last close? */
++	spidev->users--;
++	if (!spidev->users) {
++
++		kfree(spidev->smol_tx_buffer);
++		spidev->smol_tx_buffer = NULL;
++
++		kfree(spidev->smol_rx_buffer);
++		spidev->smol_rx_buffer = NULL;
++
++		if (dofree)
++			kfree(spidev);
++		else
++			spidev->speed_hz = spidev->spi->max_speed_hz;
++	}
++#ifdef CONFIG_SPI_SLAVE
++	if (!dofree)
++		spi_slave_abort(spidev->spi);
++#endif
++	mutex_unlock(&device_list_lock);
++
++	return 0;
++}
++
++static const struct file_operations spidev_fops = {
++	.owner =	THIS_MODULE,
++	/* REVISIT switch to aio primitives, so that userspace
++	 * gets more complete API coverage.  It'll simplify things
++	 * too, except for the locking.
++	 */
++	.write =	spidev_write,
++	.read =		spidev_read,
++	.unlocked_ioctl = spidev_ioctl,
++	.compat_ioctl = spidev_compat_ioctl,
++	.open =		spidev_open,
++	.release =	spidev_release,
++	.llseek =	no_llseek,
++};
++
++/*-------------------------------------------------------------------------*/
++
++/* The main reason to have this class is to make mdev/udev create the
++ * /dev/spidevB.C character device nodes exposing our userspace API.
++ * It also simplifies memory management.
++ */
++
++static struct class *spidev_class;
++
++static const struct spi_device_id spidev_spi_ids[] = {
++	{ .name = "spidev-zerocopy" },
++	{},
++};
++MODULE_DEVICE_TABLE(spi, spidev_spi_ids);
++
++/*
++ * spidev should never be referenced in DT without a specific compatible string,
++ * it is a Linux implementation thing rather than a description of the hardware.
++ */
++static int spidev_of_check(struct device *dev)
++{
++	if (device_property_match_string(dev, "compatible", "spidev") < 0)
++		return 0;
++
++	dev_err(dev, "spidev listed directly in DT is not supported\n");
++	return -EINVAL;
++}
++
++static const struct of_device_id spidev_dt_ids[] = {
++	{ .compatible = "sudomaker,spidev-zerocopy", .data = &spidev_of_check },
++	{},
++};
++MODULE_DEVICE_TABLE(of, spidev_dt_ids);
++
++/*-------------------------------------------------------------------------*/
++
++static int spidev_probe(struct spi_device *spi)
++{
++	int (*match)(struct device *dev);
++	struct spidev_data	*spidev;
++	int			status;
++	unsigned long		minor;
++
++	match = device_get_match_data(&spi->dev);
++	if (match) {
++		status = match(&spi->dev);
++		if (status)
++			return status;
++	}
++
++	/* Allocate driver data */
++	spidev = kzalloc(sizeof(*spidev), GFP_KERNEL);
++	if (!spidev)
++		return -ENOMEM;
++
++	/* Initialize the driver data */
++	spidev->spi = spi;
++	spin_lock_init(&spidev->spi_lock);
++	mutex_init(&spidev->buf_lock);
++
++	INIT_LIST_HEAD(&spidev->device_entry);
++
++	/* If we can allocate a minor number, hook up this device.
++	 * Reusing minors is fine so long as udev or mdev is working.
++	 */
++	mutex_lock(&device_list_lock);
++	minor = find_first_zero_bit(minors, N_SPI_MINORS);
++	if (minor < N_SPI_MINORS) {
++		struct device *dev;
++
++		spidev->devt = MKDEV(SPIDEV_MAJOR, minor);
++		dev = device_create(spidev_class, &spi->dev, spidev->devt,
++				    spidev, "spidev%d.%d",
++				    spi->master->bus_num, spi->chip_select);
++		status = PTR_ERR_OR_ZERO(dev);
++	} else {
++		dev_dbg(&spi->dev, "no minor number available!\n");
++		status = -ENODEV;
++	}
++	if (status == 0) {
++		set_bit(minor, minors);
++		list_add(&spidev->device_entry, &device_list);
++	}
++	mutex_unlock(&device_list_lock);
++
++	spidev->speed_hz = spi->max_speed_hz;
++
++	if (status == 0)
++		spi_set_drvdata(spi, spidev);
++	else
++		kfree(spidev);
++
++	return status;
++}
++
++static void spidev_remove(struct spi_device *spi)
++{
++	struct spidev_data	*spidev = spi_get_drvdata(spi);
++
++	/* prevent new opens */
++	mutex_lock(&device_list_lock);
++	/* make sure ops on existing fds can abort cleanly */
++	spin_lock_irq(&spidev->spi_lock);
++	spidev->spi = NULL;
++	spin_unlock_irq(&spidev->spi_lock);
++
++	list_del(&spidev->device_entry);
++	device_destroy(spidev_class, spidev->devt);
++	clear_bit(MINOR(spidev->devt), minors);
++	if (spidev->users == 0)
++		kfree(spidev);
++	mutex_unlock(&device_list_lock);
++}
++
++static struct spi_driver spidev_spi_driver = {
++	.driver = {
++		.name =		"spidev",
++		.of_match_table = spidev_dt_ids,
++	},
++	.probe =	spidev_probe,
++	.remove =	spidev_remove,
++	.id_table =	spidev_spi_ids,
++
++	/* NOTE:  suspend/resume methods are not necessary here.
++	 * We don't do anything except pass the requests to/from
++	 * the underlying controller.  The refrigerator handles
++	 * most issues; the controller driver handles the rest.
++	 */
++};
++
++/*-------------------------------------------------------------------------*/
++
++static int __init spidev_init(void)
++{
++	int status;
++
++	/* Claim our 256 reserved device numbers.  Then register a class
++	 * that will key udev/mdev to add/remove /dev nodes.  Last, register
++	 * the driver which manages those device numbers.
++	 */
++	status = register_chrdev(SPIDEV_MAJOR, "spi", &spidev_fops);
++	if (status < 0)
++		return status;
++
++	spidev_class = class_create(THIS_MODULE, "spidev");
++	if (IS_ERR(spidev_class)) {
++		unregister_chrdev(SPIDEV_MAJOR, spidev_spi_driver.driver.name);
++		return PTR_ERR(spidev_class);
++	}
++
++	status = spi_register_driver(&spidev_spi_driver);
++	if (status < 0) {
++		class_destroy(spidev_class);
++		unregister_chrdev(SPIDEV_MAJOR, spidev_spi_driver.driver.name);
++	}
++	return status;
++}
++module_init(spidev_init);
++
++static void __exit spidev_exit(void)
++{
++	spi_unregister_driver(&spidev_spi_driver);
++	class_destroy(spidev_class);
++	unregister_chrdev(SPIDEV_MAJOR, spidev_spi_driver.driver.name);
++}
++module_exit(spidev_exit);
++
++MODULE_AUTHOR("Andrea Paterniani, <a.paterniani@swapp-eng.it>");
++MODULE_AUTHOR("Reimu NotMoe <reimu@sudomaker.com>");
++MODULE_DESCRIPTION("User mode SPI device interface with zero copy");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("spi:spidev_zerocopy");

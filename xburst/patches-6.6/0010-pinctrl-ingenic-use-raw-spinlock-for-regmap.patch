@@ -1,0 +1,26 @@
+From cbcd1f23ca5e61a8bc92ea63050e5457ff08fb21 Mon Sep 17 00:00:00 2001
+From: Zhen XIN <lone.zen6@gmail.com>
+Date: Wed, 26 Aug 2026 03:44:16 +0800
+Subject: [PATCH 10/14] pinctrl: ingenic: use raw spinlock for regmap
+
+GPIO irq_chip callbacks such as irq_set_type run while the IRQ core holds a raw descriptor lock. Ingenic register updates use regmap, whose default MMIO lock is a regular spinlock, causing lockdep to report an invalid wait context during IRQ setup.
+
+Use regmap raw spinlock locking so GPIO register accesses are safe under the IRQ core raw lock.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ drivers/pinctrl/pinctrl-ingenic.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/pinctrl/pinctrl-ingenic.c b/drivers/pinctrl/pinctrl-ingenic.c
+index bf94a026b5a1..de7e80e23599 100644
+--- a/drivers/pinctrl/pinctrl-ingenic.c
++++ b/drivers/pinctrl/pinctrl-ingenic.c
+@@ -4036,6 +4036,7 @@ static const struct regmap_config ingenic_pinctrl_regmap_config = {
+ 	.reg_bits = 32,
+ 	.val_bits = 32,
+ 	.reg_stride = 4,
++	.use_raw_spinlock = true,
+ };
+ 
+ static const struct of_device_id ingenic_gpio_of_matches[] __initconst = {

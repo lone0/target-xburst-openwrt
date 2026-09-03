@@ -1,0 +1,67 @@
+From 259fb5d8f5371d9983e1eb76920abcdbd5966a97 Mon Sep 17 00:00:00 2001
+From: Zhen XIN <lone.zen6@gmail.com>
+Date: Thu, 27 Aug 2026 00:29:35 +0800
+Subject: [PATCH 11/14] mips: isolate Ingenic SMP hooks from generic kernels
+
+The generic MIPS initialization and idle code referenced Ingenic SMP functions whenever SMP was enabled. Non-Ingenic generic kernels did not build the Ingenic objects and failed to link, while multi-board kernels containing Ingenic support could invoke Ingenic initialization on another CPU family.
+
+Compile the Ingenic SMP hooks only for the dedicated MACH_INGENIC_SOC system type. Generic multi-board kernels retain the common MIPS initialization and idle paths without depending on Ingenic code.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ arch/mips/generic/init.c | 7 +++++--
+ arch/mips/kernel/idle.c  | 7 +++++--
+ 2 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/arch/mips/generic/init.c b/arch/mips/generic/init.c
+index 665a66d287d7..0a7baa255d84 100644
+--- a/arch/mips/generic/init.c
++++ b/arch/mips/generic/init.c
+@@ -15,7 +15,9 @@
+ #include <asm/fw/fw.h>
+ #include <asm/irq_cpu.h>
+ #include <asm/machine.h>
++#ifdef CONFIG_MACH_INGENIC_SOC
+ #include <asm/mach-ingenic/smp.h>
++#endif
+ #include <asm/mips-cps.h>
+ #include <asm/prom.h>
+ #include <asm/smp-ops.h>
+@@ -108,8 +110,9 @@ void __init plat_mem_setup(void)
+ 	fw_init_cmdline();
+ 	__dt_setup_arch((void *)fdt);
+ 
+-	if (IS_ENABLED(CONFIG_SMP))
+-		ingenic_smp_init();
++#if defined(CONFIG_MACH_INGENIC_SOC) && defined(CONFIG_SMP)
++	ingenic_smp_init();
++#endif
+ }
+ 
+ void __init device_tree_init(void)
+diff --git a/arch/mips/kernel/idle.c b/arch/mips/kernel/idle.c
+index a55a712430a2..5a189ba115af 100644
+--- a/arch/mips/kernel/idle.c
++++ b/arch/mips/kernel/idle.c
+@@ -18,7 +18,9 @@
+ #include <asm/cpu-type.h>
+ #include <asm/idle.h>
+ #include <asm/mipsregs.h>
++#ifdef CONFIG_MACH_INGENIC_SOC
+ #include <asm/mach-ingenic/smp.h>
++#endif
+ 
+ /*
+  * Not all of the MIPS CPUs have the "wait" instruction available. Moreover,
+@@ -215,8 +217,9 @@ void __init check_wait(void)
+ 	case CPU_XBURST:
+ 	case CPU_XBURST2:
+ 		cpu_wait = r4k_wait;
+-		if (IS_ENABLED(CONFIG_SMP))
+-			cpu_wait = jz4780_smp_wait_irqoff;
++#if defined(CONFIG_MACH_INGENIC_SOC) && defined(CONFIG_SMP)
++		cpu_wait = jz4780_smp_wait_irqoff;
++#endif
+ 		break;
+ 
+ 	case CPU_TX49XX:

@@ -1,0 +1,81 @@
+From 1d35534f6b88cdbffe31831abebe114096f481fe Mon Sep 17 00:00:00 2001
+From: Zhen XIN <lone.zen6@gmail.com>
+Date: Wed, 26 Aug 2026 03:20:34 +0800
+Subject: [PATCH 09/14] mips: ingenic: use raw locks for XBurst2 IPIs
+
+IPI sends run from scheduler wakeup paths while raw scheduler locks are
+held, so protect XBurst2 mailbox registers with raw spinlocks. Enable the
+per-CPU mailbox IRQ once on the boot CPU and from each secondary CPU.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ arch/mips/ingenic/smp.c | 17 +++++++++--------
+ 1 file changed, 9 insertions(+), 8 deletions(-)
+
+diff --git a/arch/mips/ingenic/smp.c b/arch/mips/ingenic/smp.c
+index 45f512c445dc..09585edabc7c 100644
+--- a/arch/mips/ingenic/smp.c
++++ b/arch/mips/ingenic/smp.c
+@@ -24,7 +24,7 @@
+ struct ingenic_xburst2_mailbox {
+ 	void *__iomem *base;
+ 
+-	spinlock_t lock;
++	raw_spinlock_t lock;
+ };
+ 
+ u32 ingenic_cpu_entry_sp;
+@@ -185,10 +185,10 @@ static irqreturn_t ingenic_xburst2_mbox_handler(int irq, void *dev_id)
+ 	struct ingenic_xburst2_mailbox *mailbox = dev_id;
+ 	unsigned int action = 0;
+ 
+-	spin_lock(&mailbox->lock);
++	raw_spin_lock(&mailbox->lock);
+ 	action = readl(mailbox->base);
+ 	writel(0, mailbox->base);
+-	spin_unlock(&mailbox->lock);
++	raw_spin_unlock(&mailbox->lock);
+ 
+ 	if (!action) {
+ 		pr_err("SMP[%d]:invalid mailboxes action is NULL\n",smp_processor_id());
+@@ -342,9 +342,7 @@ static void ingenic_xburst2_prepare_cpus(unsigned int max_cpus)
+ 
+ 		mailbox->base = CCU_MAILBOX_BASE + cpu * 4;
+ 
+-		enable_percpu_irq(MIPS_CPU_IRQ_BASE + 3, IRQ_TYPE_NONE);
+-
+-		spin_lock_init(&mailbox->lock);
++		raw_spin_lock_init(&mailbox->lock);
+ 
+ 		cpu_clock_gates[cpu] = of_clk_get(cpu_node, 0);
+ 		if (IS_ERR(cpu_clock_gates[cpu])) {
+@@ -355,6 +353,8 @@ static void ingenic_xburst2_prepare_cpus(unsigned int max_cpus)
+ 
+ 	write_ccu_pimr(pimr);
+ 	write_ccu_oimr(oimr);
++
++	enable_percpu_irq(MIPS_CPU_IRQ_BASE + 3, IRQ_TYPE_NONE);
+ }
+ 
+ /*
+@@ -460,6 +460,7 @@ static void ingenic_smp_finish(void)
+ 		val = read_ccu_mimr();
+ 		val |= MIMR_IM0 << cpu;
+ 		write_ccu_mimr(val);
++		enable_percpu_irq(MIPS_CPU_IRQ_BASE + 3, IRQ_TYPE_NONE);
+ 		break;
+ 	default:
+ 		panic("Unknown Ingenic CPU type.");
+@@ -518,10 +519,10 @@ static void ingenic_xburst2_send_ipi_single(int cpu, unsigned int action)
+ 	unsigned int val;
+ 	unsigned long flags;
+ 
+-	spin_lock_irqsave(&mailbox->lock, flags);
++	raw_spin_lock_irqsave(&mailbox->lock, flags);
+ 	val = readl(mailbox->base);
+ 	writel(action | val, mailbox->base);
+-	spin_unlock_irqrestore(&mailbox->lock, flags);
++	raw_spin_unlock_irqrestore(&mailbox->lock, flags);
+ }
+ 
+ static void ingenic_xburst_send_ipi_mask(const struct cpumask *mask,
