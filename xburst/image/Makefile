@@ -5,18 +5,8 @@
 # See /LICENSE for more information.
 #
 
-JFFS2_BLOCKSIZE=256k 512k
-
 include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/image.mk
-
-ifneq ($(CONFIG_TARGET_xburst_qi_lb60),)
-UBI_OPTS = -m 4096 -p 512KiB
-UBIFS_OPTS = -m 4096 -e 516096 -c 4095
-else
-UBI_OPTS = -m 2048 -p 128KiB -s 512
-UBIFS_OPTS = -m 2048 -e 126KiB -c 4096
-endif
 
 UIMAGE:=$(BIN_DIR)/$(IMG_PREFIX)-uImage.bin
 

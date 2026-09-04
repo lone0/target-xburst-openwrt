@@ -1,0 +1,63 @@
+From f838165974007288da185637f9c56d05d2dd503d Mon Sep 17 00:00:00 2001
+From: Zhen XIN <lone.zen6@gmail.com>
+Date: Thu, 27 Aug 2026 20:12:13 +0800
+Subject: [PATCH 13/14] clocksource: ingenic: acknowledge XBurst2 OST
+ interrupts
+
+XBurst2 event timers retain their comparison flag after the timer is disabled. The clockevent interrupt handler only disabled OSTER and left OSTFR asserted. When the clockevent core had no subsequent local deadline, the pending interrupt immediately retriggered and trapped the CPU in a hard-IRQ storm.
+
+This appeared as an RCU stall on an otherwise idle secondary CPU, with millions of hard interrupts and no context switches. Enabling the soft-lockup detector hid the issue because its pinned per-CPU hrtimer always supplied another deadline; set_next_event then cleared OSTFR as a side effect.
+
+Clear OSTFR whenever an XBurst2 event timer is shut down, including from its interrupt handler. Also use the XBurst2 write-zero flag semantics when preparing the next event, matching the vendor timer implementation.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ drivers/clocksource/ingenic-sysost.c | 18 +++++++++---------
+ 1 file changed, 9 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/clocksource/ingenic-sysost.c b/drivers/clocksource/ingenic-sysost.c
+index 39f339737ba6..8a22f40b7cdd 100644
+--- a/drivers/clocksource/ingenic-sysost.c
++++ b/drivers/clocksource/ingenic-sysost.c
+@@ -313,10 +313,12 @@ static int ingenic_ost_cevt_set_state_shutdown(struct clock_event_device *evt)
+ 	struct ingenic_ost_timer *timer = to_ingenic_ost_timer(evt);
+ 	struct ingenic_ost *ost = timer->ost;
+ 
+-	if (ost->soc_info->version >= ID_X2000)
++	if (ost->soc_info->version >= ID_X2000) {
+ 		writel(0, timer->base + OST_REG_OSTER);
+-	else
++		writel(0, timer->base + OST_REG_OSTFR);
++	} else {
+ 		writel(OSTECR_OST1ENC, timer->base + OST_REG_OSTECR);
++	}
+ 
+ 	return 0;
+ }
+@@ -327,7 +329,10 @@ static int ingenic_ost_cevt_set_next(unsigned long next,
+ 	struct ingenic_ost_timer *timer = to_ingenic_ost_timer(evt);
+ 	struct ingenic_ost *ost = timer->ost;
+ 
+-	writel((u32)~OSTFR_FFLAG, timer->base + OST_REG_OSTFR);
++	if (ost->soc_info->version >= ID_X2000)
++		writel(0, timer->base + OST_REG_OSTFR);
++	else
++		writel((u32)~OSTFR_FFLAG, timer->base + OST_REG_OSTFR);
+ 	writel(next, timer->base + OST_REG_OST1DFR);
+ 	writel(OSTCR_OST1CLR, timer->base + OST_REG_OSTCR);
+ 
+@@ -344,13 +349,8 @@ static int ingenic_ost_cevt_set_next(unsigned long next,
+ static irqreturn_t ingenic_ost_cevt_cb(int irq, void *dev_id)
+ {
+ 	struct ingenic_ost_timer *timer = dev_id;
+-	struct ingenic_ost *ost = timer->ost;
+-
+-	if (ost->soc_info->version >= ID_X2000)
+-		writel(0, timer->base + OST_REG_OSTER);
+-	else
+-		writel(OSTECR_OST1ENC, timer->base + OST_REG_OSTECR);
+ 
++	ingenic_ost_cevt_set_state_shutdown(&timer->cevt);
+ 	timer->cevt.event_handler(&timer->cevt);
+ 
+ 	return IRQ_HANDLED;
